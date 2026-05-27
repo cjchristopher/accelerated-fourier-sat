@@ -778,7 +778,7 @@ def main(
     if not file:
         raise ValueError("No problem file specified")
     stamp1 = time()
-    sat_parser = PBSATFormula(workers=4, n_devices=n_devices, disk_cache=disk_cache, file=file)
+    sat_parser = PBSATFormula(workers=4, n_devices=n_devices, disk_cache=disk_cache, file=file, compactify=False)
     stamp2 = time()
     read_time = stamp2 - stamp1
 

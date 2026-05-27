@@ -14,6 +14,7 @@ from boolean_whf import Clause, ClauseProcessor, Clauses, ClauseSignature, AFSAT
 from utils import LogThrottle
 
 logger = logging.getLogger(__name__)
+INT64_MAX = int(np.iinfo(np.int64).max)
 
 
 class UnsatError(Exception):
@@ -21,33 +22,43 @@ class UnsatError(Exception):
 
 
 class PBSATFormula(object):
-    """A class for parsing and processing pseudo-boolean SAT formulas from DIMACS and hybrid formats.
-    This class handles loading SAT problem instances from files, processing various constraint types
-    (CNF, XOR, NAE, AMO, EO, EK, CARD), and preparing them for parallel computation. It supports
-    both standard DIMACS CNF format and an extended hybrid format with additional constraint types.
+    """Parse and process SAT formulas from DIMACS and hybrid-constraint files.
+
+    Supports CNF, XOR, NAE, AMO, EO, EK, and CARD constraints, plus optional
+    prefix files. A PBSATFormula instance is single-use and tied to its initial input problem
+
+    Compactification is on by default to reduce the size of assignment vectors, and a variable ID map is constructed
+    to recover original variable IDs when required.
+
     Attributes:
-        clause_sets (dict[ClauseSignature, Clauses]): Dictionary mapping clause signatures to lists of clauses
-        n_var (int): Number of variables in the formula
-        n_clause (int): Number of clauses in the formula
-        n_devices (int, default=1): Number of CPUs to use for processing
-        workers (int, default=1): Number of worker threads for parallel processing
-        disk_cache (str): (Optional) Path to disk cache directory for compiled computations
-        benchmark (bool): Flag to enable benchmarking mode
+        clause_sets (dict[ClauseSignature, Clauses]): Clause groups keyed by signature (type, length, cardinality (opt))
+        unit_prefix (set[int]): Unit literals derived while parsing constraints.
+        n_var (int): Active variable count after loading.
+        n_clause (int): Loaded clause count.
+        workers (int): Worker threads for clause processing.
+        n_devices (int): Device count passed to clause processors.
+        disk_cache (AFSAT_DFTCache | None): Optional cache for compiled artifacts.
+        compactify (bool): Whether to remap input literals to dense internal IDs.
+
     Examples:
-        >>> formula = PBSATFormula(workers=4, n_devices=1)
+        >>> formula = PBSATFormula(workers=4, n_devices=1, compactify=False)
         >>> formula.read_DIMACS("problem.cnf")
-        >>> objectives = formula.process_clauses()
+        >>> objectives = formula.process_clauses_to_array()
         >>> prefixes = formula.process_prefix("prefix.txt")
-        - The class supports multiple constraint types beyond standard CNF clauses
-        - Parallel processing is used to efficiently handle large problem instances
-        - Disk caching can be enabled to avoid recompilation of objectives
-        - When using XLA persistent caching with "all" mode, workers should be set to 1
     """
 
-    def __init__(self, workers: int = 1, n_devices: int = 1, disk_cache: str = "", file: str = "") -> None:
+    def __init__(
+        self,
+        workers: int = 1,
+        n_devices: int = 1,
+        disk_cache: str = "",
+        file: str = "",
+        compactify: bool = True,
+    ) -> None:
         self.clause_sets: dict[ClauseSignature, Clauses] = {}
         self.n_devices: int = n_devices
         self.workers: int = workers
+        self.compactify: bool = compactify
         self.unit_prefix: set[int] = set()
         self.var_mapper: VarMapper = VarMapper()
         self.disk_cache: AFSAT_DFTCache | None = None
@@ -55,6 +66,7 @@ class PBSATFormula(object):
         self.n_clause: int = 0
         self.seen_max_var: int = 0
         self.seen_clauses: int = 0
+        self._loaded_file: str | None = None
         if disk_cache:
             self.disk_cache = AFSAT_DFTCache(disk_cache)
 
@@ -104,7 +116,16 @@ class PBSATFormula(object):
         Args:
             dimacs_file (str): Path to the DIMACS format file to be parsed
         """
-        self.var_mapper.reset_map()
+        if self._loaded_file is not None:
+            raise RuntimeError(
+                f"Problem already loaded ('{self._loaded_file}')! "
+                "Create a new PBSATFormula instance for another problem file."
+            )
+
+        self.clause_sets = {}
+        self.unit_prefix = set()
+        self.seen_max_var = 0
+        self.seen_clauses = 0
 
         throttle = LogThrottle(logger)
         used_input_vars: set[int] = set()
@@ -169,6 +190,14 @@ class PBSATFormula(object):
 
             lits = [int(val) for val in tokens[lit_offset:-1]]  # drop trailing 0
             n = len(lits)
+
+            if 0 in lits:
+                logger.error(f"Line {idx}: Clause literals must be non-zero integers: {line}")
+                raise ValueError
+
+            if any(abs(lit) > INT64_MAX for lit in lits):
+                logger.error(f"Line {idx}: Literal index exceeds signed 64-bit range: {line}")
+                raise ValueError
 
             self.seen_clauses += 1
             if n:
@@ -304,7 +333,8 @@ class PBSATFormula(object):
                             print('s UNSATISFIABLE')
                             raise e
                         except ValueError as e:
-                            print(f"Error processing clause: {e}")
+                            logger.error(f"Error processing clause on line {idx}: {line}")
+                            raise e
 
                 throttle.flush()
 
@@ -315,10 +345,14 @@ class PBSATFormula(object):
                     )
                     self.n_clause = self.seen_clauses
 
-                self.var_mapper.build_map(used_input_vars)
-                self.n_var = len(self.var_mapper.used_input_vars)
-
-                self.clause_sets, self.unit_prefix = self.var_mapper.remap_formula(self.clause_sets, self.unit_prefix)
+                if self.compactify:
+                    self.var_mapper.build_map(used_input_vars)
+                    self.n_var = len(self.var_mapper.used_input_vars)
+                    self.clause_sets = self.var_mapper.remap_clause_set(self.clause_sets)
+                    self.unit_prefix = self.var_mapper.remap_prefix(self.unit_prefix)
+                else:
+                    # Stay in input-id space for low-overhead workflows like validation.
+                    self.n_var = max(self.seen_max_var, self.n_var)
 
                 logger.info(
                     f"Processed file: {dimacs_file}, with {len(self.clause_sets)} objectives (clause sets)"
@@ -330,6 +364,7 @@ class PBSATFormula(object):
         except Exception as e:
             print(f"Error processing file: {e}")
             raise e
+        self._loaded_file = dimacs_file
 
     def process_clauses_to_array(self) -> tuple[Objective, ...]:
         """
@@ -421,32 +456,55 @@ class PBSATFormula(object):
                 total = 0
                 with open(prefix_file, "r") as f:
                     for idx, line in enumerate(f):
-                        prefix_lits = line.strip().split()
-                        if not prefix_lits or prefix_lits[0] in ("c", "#", "*"):
+                        raw_tokens = line.strip().split()
+                        if not raw_tokens or raw_tokens[0] in ("c", "#", "*"):
                             continue
                         total += 1
                         try:
-                            prefix_lits_raw = set(int(lit) for lit in prefix_lits)
-                            prefix_lits = set()
-                            for lit in prefix_lits_raw:
-                                dense_lit = self.var_mapper.input_to_dense(lit, strict=False)
-                                if dense_lit is None:
-                                    logger.warning(
-                                        f"Line {idx}: Prefix literal {lit} references an unused variable and is ignored"
-                                    )
+                            prefix_lits_raw: set[int] = set()
+                            for idx, token in enumerate(raw_tokens):
+                                lit = int(token)
+                                if lit == 0:
+                                    if idx == len(raw_tokens) - 1:
+                                        raise ValueError("Prefix literals must be non-zero integers")
                                     continue
-                                prefix_lits.add(dense_lit)
+                                if abs(lit) > INT64_MAX:
+                                    raise ValueError("Prefix literal exceeds signed 64-bit range")
+                                prefix_lits_raw.add(lit)
+
+                            if self.compactify and self.var_mapper.input_to_dense_var:
+                                prefix_lits: set[int] = set()
+                                for lit in prefix_lits_raw:
+                                    dense_lit = self.var_mapper.input_to_dense(lit, strict=False) if self.compactify else lit
+                                    if dense_lit is None or dense_lit == 0:
+                                        logger.warning(f"Line {idx}: Invalid prefix literal {lit} is ignored")
+                                        continue
+                                    if abs(dense_lit) > self.n_var:
+                                        logger.warning(
+                                            f"Line {idx}: Prefix literal {lit} is out of range for loaded variables and is ignored"
+                                        )
+                                        continue
+                                    prefix_lits.add(dense_lit)
+                            else:
+                                prefix_lits = prefix_lits_raw
+
                             # Invert and check for overlap implies a conflict between the problem and the prefix.
                             neg_lits = set(-lit for lit in prefix_lits)
-                            conflict = self.unit_prefix.intersection(neg_lits)
-                            if conflict:
+                            self_conflict = prefix_lits.intersection(neg_lits)
+                            if self_conflict:
+                                logger.warning(f"Conflict ({self_conflict}) within prefix-{idx}- skipping: {line}")
+                                skipped += 1
+                                continue
+                            unit_conflict = self.unit_prefix.intersection(neg_lits)
+                            if unit_conflict:
                                 logger.warning(
-                                    f"Conflict ({conflict}) with unit literals in prefix-{idx}- skipping: {line}"
+                                    f"Conflict ({unit_conflict}) with unit literals in prefix-{idx}- skipping: {line}"
                                 )
                                 skipped += 1
                                 continue
+
                             merged = prefix_lits | self.unit_prefix
-                            vecs.append(__lits_to_prefix(merged))
+                            vecs.append(__lits_to_prefix(set(sorted(merged, key=lambda x: abs(x)))))
                         except (ValueError, TypeError):
                             logger.warning(f"Line {idx}: Invalid prefix entry: {line.strip()}")
                             continue

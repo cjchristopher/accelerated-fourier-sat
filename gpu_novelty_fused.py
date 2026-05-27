@@ -13,6 +13,7 @@ import functools
 import logging
 import math
 import os
+import sys
 from argparse import ArgumentParser as ArgParse
 from time import perf_counter as time
 from typing import NamedTuple
@@ -43,7 +44,7 @@ import numpy as np
 from jax import Array
 from jax.sharding import Mesh, NamedSharding
 from tqdm.auto import tqdm
-from utils import get_gpu_l2_cache_size
+from utils import get_gpu_l2_cache_size, LOG_LEVELS
 
 from boolean_whf import ClauseArrays, clause_type_ids
 from sat_loader import PBSATFormula
@@ -72,6 +73,7 @@ class BeamState(NamedTuple):
     points: Array           # (batch_size, n_vars) current beam
     best_candidate: Array   # (n_vars,) best assignment seen
     best_unsat: Array       # () scalar, best unsat count
+    raw_unsat: Array        # (n_expanded,) unsat counts from latest expansion
     clause_totals: Array    # (n_clauses,) accumulated for reweighting
     iter_count: Array       # () iteration counter
     rng_key: Array          # PRNG state
@@ -349,6 +351,7 @@ def make_gpu_inner_loop(
                 points=new_points,
                 best_candidate=new_best_candidate,
                 best_unsat=new_best_unsat,
+                raw_unsat=unsats,
                 clause_totals=new_clause_totals,
                 iter_count=state.iter_count + 1,
                 rng_key=rng_key,
@@ -384,6 +387,9 @@ def run_beam_search(
     weight_decay: float = 0.9,
     prefixes: np.ndarray | None = None,
     binary_v: bool = False,
+    var_mapper: VarMapper = None,
+    benchmark: bool = False,
+    unsat_h: int = 0
 ) -> float:
     """Run parallel beam search SAT solver with fused GPU inner loop."""
 
@@ -404,6 +410,7 @@ def run_beam_search(
     n_prefix = prefixes.shape[0] if prefixes is not None else 0
     single_prefix = (n_prefix == 1)
     multi_prefix = (n_prefix > 1)
+    ttfs = 0
 
     if single_prefix:
         assert prefixes is not None
@@ -528,6 +535,7 @@ def run_beam_search(
         points=points,
         best_candidate=points[0],
         best_unsat=jnp.array(n_clauses, dtype=jnp.int32),
+        raw_unsat=jnp.full((batch_size * top_m,), n_clauses, dtype=jnp.int32),
         clause_totals=jnp.zeros(n_clauses, dtype=jnp.float32),
         iter_count=jnp.array(0, dtype=jnp.int32),
         rng_key=rng_key,
@@ -538,6 +546,7 @@ def run_beam_search(
     total_iters: int = 0
     batches_done: int = 0
     restart_ct: int = 0
+    all_unsats: list[int] = []
     best_assignment: tuple[bool, ...]
     best_unsat_host: int = n_clauses
     found_sol: bool = False
@@ -573,6 +582,10 @@ def run_beam_search(
 
         total_iters += inner_iters
         batches_done += 1
+
+        # Reuse UNSAT values already produced in the GPU loop state.
+        batch_unsats = np.array(state.raw_unsat).astype(int).flatten().tolist()
+        all_unsats.extend(batch_unsats)
 
         # Track best assignment
         best_unsat_val = int(state.best_unsat)
@@ -670,6 +683,8 @@ def run_beam_search(
         if ttfs:
             logger.info(f"X-TTFS {ttfs}")
         logger.info("START EXP")
+        logger.info(f"X-CLAUSES {n_clauses}")
+        logger.info(f"X-VARS {n_vars}")
         logger.info(f"X-GPU {n_devices}")
         logger.info(f"X-PPBATCH {batch_size}")
         logger.info(f"X-PPGPUBATCH {batch_size // n_devices} PPBATCH/GPU")
@@ -682,7 +697,8 @@ def run_beam_search(
         else:
             logger.info("X-SOLS 0")
             logger.info("X-UQSOLS 0")
-        logger.info(f"X-ITERS {total_iters}")
+        logger.info(f"X-RAWITER {[total_iters]}")
+        logger.info(f"X-RAWUNSAT {all_unsats}")
         logger.info(f"X-BEAM {batch_size}")
         logger.info(f"X-BEST_UNSAT {best_unsat_val}")
         logger.info("END EXP")
@@ -709,6 +725,8 @@ def main(
     restart_thresh: int = 0,
     weight_decay: float = 0.9,
     prefix_file: str = "",
+    benchmark: bool = False,
+    unsat_h: float = 0.0,
 ) -> None:
     """Main entry point."""
     stamp1 = time()
@@ -747,6 +765,8 @@ def main(
         weight_decay=weight_decay,
         prefixes=prefixes,
         var_mapper=sat_parser.var_mapper,
+        benchmark=benchmark,
+        unsat_h=int(unsat_h * 2 * n_var) if unsat_h else 0
     )
 
     logger.info(f"Time reading input: {read_time}")
@@ -769,20 +789,22 @@ if __name__ == "__main__":
     parser.add_argument("--cache", type=str, default="", help="Disk cache for FFT matrices")
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose logging")
     parser.add_argument("-m", "--top-m", type=int, default=1, help="Top m neighbors per point")
-    parser.add_argument("--beta", type=float, default=0.0, help="Cull fraction (0.0-1.0)")
-    parser.add_argument("-r", "--restart", type=int, default=0, help="Reweight interval (0=never)")
+    parser.add_argument("--beta", type=float, default=0.1, help="Cull fraction (0.0-1.0)")
+    parser.add_argument("-r", "--restart", type=int, default=1, help="Reweight interval (0=never)")
     parser.add_argument("-a", "--alpha", type=float, default=0.9, help="Weight decay (0.0-1.0)")
     parser.add_argument("-p", "--prefix", type=str, default="", help="Prefix file (fixed variable assignments)")
+    parser.add_argument("-e", "--benchmark", action="store_true", default=True, help="Benchmark mode (reduce output)")
     parser.add_argument("--progress", action="store_false", dest="benchmark", help="Display progress stats (equiv to -e False)")
     parser.add_argument("-d", "--debug", choices=LOG_LEVELS, default="ERROR", help=f"Set logging level ({LOG_LEVELS})")
     parser.add_argument("--stdout_log", action="store_true", help="Send log output to stdout instead of stderr")
     parser.add_argument("--binary_v", action="store_true", default=False, help="Short form solution string")
+    parser.add_argument("-u", "--unsat_thresh", type=float, default=0, help="Stop when #UNSAT drops below threshold (PLE)")
 
     args = parser.parse_args()
     logging.basicConfig(
-        level=getattr(logging, config.output_logging.debug_level.upper()),
+        level=getattr(logging, args.debug.upper()),
         format="c %(name)s - %(levelname)s - %(message)s",
-        handlers=[logging.StreamHandler(sys.stdout if config.output_logging.stdout_log else sys.stderr)],
+        handlers=[logging.StreamHandler(sys.stdout if args.stdout_log else sys.stderr)],
     )
 
     main(
@@ -799,4 +821,6 @@ if __name__ == "__main__":
         restart_thresh=args.restart,
         weight_decay=args.alpha,
         prefix_file=args.prefix,
+        benchmark=args.benchmark,
+        unsat_h=args.unsat_thresh,
     )
