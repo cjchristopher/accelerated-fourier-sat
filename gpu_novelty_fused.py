@@ -383,6 +383,7 @@ def run_beam_search(
     restart_thresh: int = 0,
     weight_decay: float = 0.9,
     prefixes: np.ndarray | None = None,
+    binart_v: bool = False,
 ) -> float:
     """Run parallel beam search SAT solver with fused GPU inner loop."""
 
@@ -772,6 +773,10 @@ if __name__ == "__main__":
     parser.add_argument("-r", "--restart", type=int, default=0, help="Reweight interval (0=never)")
     parser.add_argument("-a", "--alpha", type=float, default=0.9, help="Weight decay (0.0-1.0)")
     parser.add_argument("-p", "--prefix", type=str, default="", help="Prefix file (fixed variable assignments)")
+    parser.add_argument("--progress", action="store_false", dest="benchmark", help="Display progress stats (equiv to -e False)")
+    parser.add_argument("-d", "--debug", choices=LOG_LEVELS, default="ERROR", help=f"Set logging level ({LOG_LEVELS})")
+    parser.add_argument("--stdout_log", action="store_true", help="Send log output to stdout instead of stderr")
+    parser.add_argument("--binary_v", action="store_true", default=False, help="Short form solution string")
 
     args = parser.parse_args()
     logging.basicConfig(
