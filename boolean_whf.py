@@ -54,8 +54,8 @@ class Objective(NamedTuple):
 clause_type_ids: dict[str, int] = {"card": 0, "xor": 1, "eo": 2, "nae": 3, "cnf": 4, "amo": 5, "ek": 6}
 
 
-class FFSAT_DFTCache:
-    """Unified caching system for FFSAT."""
+class AFSAT_DFTCache:
+    """Unified caching system for AFSAT."""
 
     # TODO: Implement smart retrieval from disk of precomputed FFT matrices for (c_type, n, k) tuples.
     # Required for meaningful deployment for fast preprocessing.
@@ -111,12 +111,12 @@ class FFSAT_DFTCache:
 
 
 class ClauseProcessor:
-    def __init__(self, n_devices: int = 1, disk_cache: FFSAT_DFTCache | None = None) -> None:
+    def __init__(self, n_devices: int = 1, disk_cache: AFSAT_DFTCache | None = None) -> None:
         self.n_devices: int = n_devices
         self.live_cache: dict = {}
-        self.disk_cache: FFSAT_DFTCache | None = None
+        self.disk_cache: AFSAT_DFTCache | None = None
 
-        if disk_cache and isinstance(disk_cache, FFSAT_DFTCache):
+        if disk_cache and isinstance(disk_cache, AFSAT_DFTCache):
             self.disk_cache = disk_cache
 
     def _wf_coeffs(self, sig: ClauseSignature) -> NDArray:

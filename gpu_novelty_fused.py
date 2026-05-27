@@ -392,6 +392,7 @@ def run_beam_search(
     jax.sharding.set_mesh(mesh)
 
     seed = int(time()) if rand_seed else 42
+    logger.info(f"seed={seed}, rand_seed={rand_seed}")
     rng_key = jax.random.PRNGKey(seed)
     rng_key, init_key = jax.random.split(rng_key)
 
@@ -411,7 +412,7 @@ def run_beam_search(
         flip_mask = jnp.eye(n_vars, dtype=bool)[free_indices]  # (n_free, n_vars)
         fixed_mask_1d = jnp.array(prefixes[0] != 0)             # (n_vars,) True where fixed
         prefix_bools_1d = jnp.array(prefixes[0] < 0)            # (n_vars,) True where var=True
-        print(f"Single prefix: {n_flip} free vars (reduced from {n_vars})")
+        logger.info(f"Single prefix: {n_flip} free vars (reduced from {n_vars})")
     elif multi_prefix:
         assert prefixes is not None
         # Per-prefix reduced flip masks, padded to max_n_free with zero-rows.
@@ -428,7 +429,7 @@ def run_beam_search(
         all_fixed_masks = jnp.array(prefixes != 0)   # (n_prefix, n_vars)
         all_prefix_bools = jnp.array(prefixes < 0)    # (n_prefix, n_vars)
         waste_pct = 100 * (1 - sum(n_free_per_prefix) / (n_prefix * max_n_free))
-        print(f"Multi-prefix: {n_prefix} vectors, max_n_free={max_n_free}/{n_vars}, padding waste={waste_pct:.1f}%")
+        logger.info(f"Multi-prefix: {n_prefix} vectors, max_n_free={max_n_free}/{n_vars}, padding waste={waste_pct:.1f}%")
     else:
         flip_mask = jnp.eye(n_vars, dtype=bool)
         n_flip = n_vars
@@ -441,24 +442,24 @@ def run_beam_search(
     if max_iters > 0 and max_iters % inner_iters != 0:
         old = max_iters
         max_iters = ((max_iters // inner_iters) + 1) * inner_iters
-        print(f"WARNING: Adjusted max_iters {old} -> {max_iters} (multiple of {inner_iters})")
+        logger.info(f"Adjusted max_iters {old} -> {max_iters} (multiple of {inner_iters})")
 
     # Auto-select batch size
     if batch_size == -1:
-        print("Guessing optimal batch size")
+        logger.info("Guessing optimal batch size")
         l2_cache_size = get_gpu_l2_cache_size(devices[0])
         if l2_cache_size is not None:
             gpu_mem_target = int(l2_cache_size * 0.90) * n_devices * 2
-            print(f"Targeting total cache: {l2_cache_size / (1024*1024):.1f} MB per GPU")
+            logger.info(f"Targeting total cache: {l2_cache_size / (1024*1024):.1f} MB per GPU")
         else:
             gpu_mem_target = devices[0].memory_stats()["bytes_limit"] * 0.01
-            print("Cache size unknown, using 1% VRAM heuristic")
+            logger.info("Cache size unknown, using 1% VRAM heuristic")
 
         dtype_sz = jnp.dtype(cls[0].lits.dtype).itemsize
         all_obj_sz = sum([np.prod([*ca.lits.shape, dtype_sz]) for ca in cls])
         flip_sz = (n_clauses * n_flip + n_flip * n_vars) * jnp.dtype(bool).itemsize
         batch_size = int(np.floor((gpu_mem_target - all_obj_sz) / flip_sz)) * n_devices
-        print(f"Batch size: {batch_size} (n_flip={n_flip}, consumed by clauses: {all_obj_sz / (1024*1024):.1f} MB)")
+        logger.info(f"Batch size: {batch_size} (n_flip={n_flip}, consumed by clauses: {all_obj_sz / (1024*1024):.1f} MB)")
 
     # Batch alignment: must be divisible by n_devices and n_prefix (if any).
     alignment = math.lcm(max(n_prefix, 1), n_devices)
@@ -468,6 +469,7 @@ def run_beam_search(
     # Recompute n_cull/n_keep after final batch_size is settled.
     n_cull = int(batch_size * beta)
     n_keep = batch_size - n_cull
+    logger.info(f"Throwing away {n_cull} points after each batch of {batch_size} (before flip) points (keeping {n_keep})")
 
     # Create GPU loop factory
     make_inner_loop, get_solutions, clear_solutions = make_gpu_inner_loop(
@@ -532,16 +534,20 @@ def run_beam_search(
         weights=weights,
     )
 
-    total_iters = 0
-    restart_ct = 0
-    best_assignment = None
-    best_unsat_host = n_clauses
+    total_iters: int = 0
+    batches_done: int = 0
+    restart_ct: int = 0
+    best_assignment: tuple[bool, ...]
+    best_unsat_host: int = n_clauses
+    found_sol: bool = False
 
-    pbar = tqdm(
-        total=timeout,
-        desc="iter 0 (best=undef)",
-        bar_format="{l_bar}{bar}|{elapsed}/{total_fmt} {postfix}",
-    )
+    pbar = None
+    if not benchmark:
+        pbar = tqdm(
+            total=timeout,
+            desc="iter 0 (best=undef)",
+            bar_format="{l_bar}{bar}|{elapsed}/{total_fmt} {postfix}",
+        )
 
     t0 = time()
     last_update = t0
@@ -565,36 +571,46 @@ def run_beam_search(
         jax.block_until_ready(state)
 
         total_iters += inner_iters
+        batches_done += 1
 
         # Track best assignment
         best_unsat_val = int(state.best_unsat)
         if best_unsat_val < best_unsat_host:
-            best_assignment = np.array(state.best_candidate)
+            best_assignment = tuple(np.array(state.best_candidate).tolist())
             best_unsat_host = best_unsat_val
+
+        if best_unsat_val == 0 and not found_sol:
+            ttfs = time() - t0
+
+        # Threshold stop for MAXSAT-style runs (implicit early stop when threshold is set).
+        if unsat_h and best_unsat_val <= unsat_h:
+            if not found_sol:
+                ttfs = time() - t0
+            break
 
         # Check for early exit (non-counting mode)
         if state.done and not counting:
-            best_assignment = np.array(state.best_candidate)
-            print(f"\nSAT! Found at ~iteration {total_iters}")
+            best_assignment = tuple(np.array(state.best_candidate).tolist())
             break
 
         # Report solutions found (counting mode)
         n_found = len(get_solutions())
-        if counting and n_found > 0:
-            print(f"\nSolutions so far: {n_found}")
+        if counting and n_found > 0 and not benchmark:
+            logger.info(f"Solutions so far: {n_found}")
 
         # Reweight clauses
         if restart_thresh > 0:
             clause_totals = np.array(state.clause_totals)
-            worst = max(clause_totals.max(), 1.0)
-            old_w = np.array(state.weights)
-            new_w = weight_decay * old_w + (1 - weight_decay) * clause_totals / worst
-            state = state._replace(weights=jnp.array(new_w, dtype=jnp.float32))
+            if np.any(clause_totals):
+                worst = max(float(clause_totals.max()), 1.0)
+                old_w = np.array(state.weights)
+                new_w = weight_decay * old_w + (1 - weight_decay) * clause_totals / worst
+                state = state._replace(weights=jnp.array(new_w, dtype=jnp.float32))
             restart_ct += 1
 
         # Progress update
         now = time()
-        if now - last_update > 0.5:
+        if pbar is not None and now - last_update > 0.5:
             elapsed = now - t0
             pbar.n = min(elapsed, timeout)
             pbstr = f"{total_iters % inner_iters}/{inner_iters}" if restart_thresh else f"{total_iters}"
@@ -603,44 +619,72 @@ def run_beam_search(
             pbar.refresh()
             last_update = now
 
-    pbar.close()
+    if pbar is not None:
+        pbar.close()
     solve_time = time() - t0
 
     # Final output
-    best_unsat_val = int(state.best_unsat)
-    if counting:
-        all_solutions = get_solutions()
-        if all_solutions:
-            print("SAT!")
-            assignment = all_solutions[0]
-            out_string = "v"
-            for i in range(n_vars):
-                lit = i + 1
-                out_string += f" {lit}" if assignment[i] else f" {-lit}"
-            print(out_string)
-            print(f"Found {len(all_solutions)} solutions")
-        else:
-            print(f"No solution found. Best unsat count: {best_unsat_val}")
-    elif best_unsat_val == 0 and best_assignment is not None:
-        print("SAT!")
-        out_string = "v"
-        for i in range(n_vars):
-            lit = i + 1
-            out_string += f" {lit}" if best_assignment[i] else f" {-lit}"
-        print(out_string)
-    else:
-        print(f"No solution found. Best unsat count: {best_unsat_val}")
-        if best_assignment is not None:
-            out_string = "v"
-            for i in range(n_vars):
-                lit = i + 1
-                out_string += f" {lit}" if best_assignment[i] else f" {-lit}"
-            print(f"Best assignment: {out_string}")
+    best_unsat_val = min(int(state.best_unsat), best_unsat_host)
+    all_sols: dict[tuple[bool, ...], int] = {}
+    first_sol: tuple[bool, ...] | None = None
 
-    logger.info(f"X-ITERS {total_iters}")
-    logger.info(f"X-TIME {solve_time}")
-    logger.info(f"X-BEAM {batch_size}")
-    logger.info(f"X-BEST_UNSAT {best_unsat_val}")
+    if counting:
+        for sol in get_solutions():
+            all_sols[sol] = all_sols.get(sol, 0) + 1
+        if all_sols:
+            first_sol = next(iter(all_sols.keys()))
+    elif best_unsat_val == 0:
+        first_sol = best_assignment
+        all_sols[first_sol] = 1
+
+    sol_info = "GPU Beam Search (Greedy Novelty (Bit Flip)) SAT"
+    print(f"c {'-' * len(sol_info)}")
+    print(f"c {sol_info}")
+    print(f"c {'-' * len(sol_info)}")
+
+    if len(all_sols):
+        print("s SATISFIABLE")
+        for sol_i, sol in enumerate(all_sols.keys()):
+            if not counting and first_sol != sol:
+                continue
+            sol_str = var_mapper.assn_str(sol, binary=binary_v)
+            if counting:
+                logger.info(f"{sol_i + 1}: v {sol_str} 0")
+                if not sol_i:
+                    print("c ENUMERATING - example solution (of possibly many):")
+                    print(f"v {sol_str} 0")
+            elif first_sol == sol:
+                print(f"v {sol_str} 0")
+                break
+    else:
+        assign_str = var_mapper.assn_str(best_assignment, binary=binary_v, inc_zero=True)
+        print("s UNKNOWN")
+        print("c Best found MAX-SAT assignment (zero energy variables omitted or -):")
+        print(f"o {best_unsat_val}")
+        print(f"v {assign_str} 0")
+
+    print(f"c {'-' * len(sol_info)}")
+
+    if logger.isEnabledFor(logging.INFO):
+        if ttfs:
+            logger.info(f"X-TTFS {ttfs}")
+        logger.info("START EXP")
+        logger.info(f"X-GPU {n_devices}")
+        logger.info(f"X-PPBATCH {batch_size}")
+        logger.info(f"X-PPGPUBATCH {batch_size // n_devices} PPBATCH/GPU")
+        logger.info(f"X-BATCHES {batches_done}")
+        logger.info(f"X-PTOTAL {batches_done * batch_size} BATCHES*PPBATCH")
+        logger.info(f"X-LOOP {solve_time}")
+        if len(all_sols):
+            logger.info(f"X-SOLS {sum(all_sols.values())}")
+            logger.info(f"X-UQSOLS {len(all_sols.keys())}")
+        else:
+            logger.info("X-SOLS 0")
+            logger.info("X-UQSOLS 0")
+        logger.info(f"X-ITERS {total_iters}")
+        logger.info(f"X-BEAM {batch_size}")
+        logger.info(f"X-BEST_UNSAT {best_unsat_val}")
+        logger.info("END EXP")
 
     return solve_time
 
@@ -701,6 +745,7 @@ def main(
         restart_thresh=restart_thresh,
         weight_decay=weight_decay,
         prefixes=prefixes,
+        var_mapper=sat_parser.var_mapper,
     )
 
     logger.info(f"Time reading input: {read_time}")
@@ -710,7 +755,7 @@ def main(
 
 if __name__ == "__main__":
     n_devices = len(jax.devices("gpu"))
-    print(jax.devices("gpu"))
+    logger.info(jax.devices("gpu"))
 
     parser = ArgParse(description="GPU Beam Search SAT Solver (Fused)")
     parser.add_argument("file", type=str, help="Input file (.cnf, .hybrid, .opb)")
@@ -729,9 +774,11 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--prefix", type=str, default="", help="Prefix file (fixed variable assignments)")
 
     args = parser.parse_args()
-
-    if args.verbose:
-        logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(
+        level=getattr(logging, config.output_logging.debug_level.upper()),
+        format="c %(name)s - %(levelname)s - %(message)s",
+        handlers=[logging.StreamHandler(sys.stdout if config.output_logging.stdout_log else sys.stderr)],
+    )
 
     main(
         file=args.file,

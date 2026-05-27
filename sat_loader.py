@@ -9,7 +9,8 @@ from typing import NamedTuple
 import numpy as np
 from numpy.typing import NDArray
 
-from boolean_whf import Clause, ClauseProcessor, Clauses, ClauseSignature, FFSAT_DFTCache, Objective, clause_type_ids
+from var_mapper import VarMapper
+from boolean_whf import Clause, ClauseProcessor, Clauses, ClauseSignature, AFSAT_DFTCache, Objective, clause_type_ids
 from utils import LogThrottle
 
 logger = logging.getLogger(__name__)
@@ -17,28 +18,6 @@ logger = logging.getLogger(__name__)
 
 class UnsatError(Exception):
     pass
-
-
-class LogThrottle:
-    """Throttles repeated logger.debug messages. After `limit` calls with the same key,
-    further messages are suppressed. Call flush() to emit suppressed counts."""
-
-    def __init__(self, limit: int = 5):
-        self.limit = limit
-        self._counts: dict[str, int] = {}
-
-    def debug(self, key: str, msg: str) -> None:
-        count = self._counts.get(key, 0) + 1
-        self._counts[key] = count
-        if count <= self.limit:
-            logger.debug(msg)
-
-    def flush(self) -> None:
-        for key, count in self._counts.items():
-            suppressed = count - self.limit
-            if suppressed > 0:
-                logger.debug(f"... suppressed {suppressed} further '{key}' messages")
-        self._counts.clear()
 
 
 class PBSATFormula(object):
@@ -67,14 +46,17 @@ class PBSATFormula(object):
 
     def __init__(self, workers: int = 1, n_devices: int = 1, disk_cache: str = "", file: str = "") -> None:
         self.clause_sets: dict[ClauseSignature, Clauses] = {}
-        self.n_var: int = 0
-        self.n_clause: int = 0
         self.n_devices: int = n_devices
         self.workers: int = workers
         self.unit_prefix: set[int] = set()
-        self.disk_cache: FFSAT_DFTCache | None = None
+        self.var_mapper: VarMapper = VarMapper()
+        self.disk_cache: AFSAT_DFTCache | None = None
+        self.n_var: int = 0
+        self.n_clause: int = 0
+        self.seen_max_var: int = 0
+        self.seen_clauses: int = 0
         if disk_cache:
-            self.disk_cache = FFSAT_DFTCache(disk_cache)
+            self.disk_cache = AFSAT_DFTCache(disk_cache)
 
         if file:
             self.read_DIMACS(file)
@@ -122,8 +104,10 @@ class PBSATFormula(object):
         Args:
             dimacs_file (str): Path to the DIMACS format file to be parsed
         """
+        self.var_mapper.reset_map()
 
         throttle = LogThrottle(logger)
+        used_input_vars: set[int] = set()
 
         def __process_clause(idx: int, line: str, tokens: list[str]) -> None:
             """
@@ -185,6 +169,12 @@ class PBSATFormula(object):
 
             lits = [int(val) for val in tokens[lit_offset:-1]]  # drop trailing 0
             n = len(lits)
+
+            self.seen_clauses += 1
+            if n:
+                abs_lits = [abs(lit) for lit in lits]
+                self.seen_max_var = max(self.seen_max_var, max(abs_lits))
+                used_input_vars.update(abs_lits)
 
             # Clause extracted. Check for errors in spec, correct generic edge cases.
             if n == 0:
@@ -294,12 +284,11 @@ class PBSATFormula(object):
 
                     # Problem metadata
                     elif tokens[0] == "p":
-                        if len(tokens) == 4:
-                            self.n_var = int(tokens[-2])
-                            self.n_clause = int(tokens[-1])
-                        elif len(tokens) == 5:
-                            self.n_var = int(tokens[-3])
-                            self.n_clause = int(tokens[-2])
+                        if len(tokens) in (4, 5):
+                            # 4 was -2/-1 and 5 was -3/-2, but I think that's
+                            # always just 2 and 3 right? n_var is always index 2 and n_clause is always 3?
+                            self.n_var = int(tokens[2]) #was -(len(tokens)-2)
+                            self.n_clause = int(tokens[3]) #was  -(len(tokens)-3)
                         else:
                             logger.error(f"Line {idx}: Malformed problem specification: {line}")
                             raise ValueError
@@ -318,20 +307,22 @@ class PBSATFormula(object):
                             print(f"Error processing clause: {e}")
 
                 throttle.flush()
-                calc_n_clause = sum([len(clause_set) for clause_set in self.clause_sets.values()])
-                calc_n_var = max(abs(lit) for clauses in self.clause_sets.values() for lits in clauses for lit in lits)
 
-                if calc_n_clause != self.n_clause or calc_n_var != self.n_var:
+                if self.seen_clauses != self.n_clause or self.seen_max_var != self.n_var:
                     logger.warning(
                         f"Metadata mismatch! Header specified {self.n_var} variables and {self.n_clause} clauses, "
-                        + f"but we processed {calc_n_var} variables and {calc_n_clause} clauses!"
+                        + f"but we processed {self.seen_max_var} variables and {self.seen_clauses} clauses!"
                     )
-                    self.n_clause = calc_n_clause
-                    self.n_var = calc_n_var
+                    self.n_clause = self.seen_clauses
+
+                self.var_mapper.build_map(used_input_vars)
+                self.n_var = len(self.var_mapper.used_input_vars)
+
+                self.clause_sets, self.unit_prefix = self.var_mapper.remap_formula(self.clause_sets, self.unit_prefix)
 
                 logger.info(
                     f"Processed file: {dimacs_file}, with {len(self.clause_sets)} objectives (clause sets)"
-                    f" - a total of {self.n_clause} clauses over {self.n_var} variables"
+                    f" - a total of {self.n_clause} clauses over {self.n_var} active variables"
                 )
         except FileNotFoundError as e:
             print(f"Error: File '{dimacs_file}' not found")
@@ -435,7 +426,16 @@ class PBSATFormula(object):
                             continue
                         total += 1
                         try:
-                            prefix_lits = set(int(lit) for lit in prefix_lits)
+                            prefix_lits_raw = set(int(lit) for lit in prefix_lits)
+                            prefix_lits = set()
+                            for lit in prefix_lits_raw:
+                                dense_lit = self.var_mapper.input_to_dense(lit, strict=False)
+                                if dense_lit is None:
+                                    logger.warning(
+                                        f"Line {idx}: Prefix literal {lit} references an unused variable and is ignored"
+                                    )
+                                    continue
+                                prefix_lits.add(dense_lit)
                             # Invert and check for overlap implies a conflict between the problem and the prefix.
                             neg_lits = set(-lit for lit in prefix_lits)
                             conflict = self.unit_prefix.intersection(neg_lits)

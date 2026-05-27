@@ -187,7 +187,6 @@ class Optimiser(abc.ABC):
         self.algo = algorithm
         self.maxiter = maxiter
         self.warmup_sol = False
-        self.memest = None
 
         # TODO: Change to optimistix when mature.
         # if self.sol_name in ["optim"]:
