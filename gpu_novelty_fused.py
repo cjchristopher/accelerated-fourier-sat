@@ -383,7 +383,7 @@ def run_beam_search(
     restart_thresh: int = 0,
     weight_decay: float = 0.9,
     prefixes: np.ndarray | None = None,
-    binart_v: bool = False,
+    binary_v: bool = False,
 ) -> float:
     """Run parallel beam search SAT solver with fused GPU inner loop."""
 
