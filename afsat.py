@@ -8,11 +8,13 @@ import math
 import os
 import sys
 import shutil
-from argparse import ArgumentParser as ArgParse
+from argparse import SUPPRESS
 from collections import Counter, defaultdict
 from contextlib import nullcontext
 from time import perf_counter as time
 from typing import TypeAlias, overload
+
+from jsonargparse import ArgumentParser as ArgParse
 
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"  # Disable pre-allocation
 os.environ["XLA_CLIENT_MEM_FRACTION"] = "0.95"  # Use full memory allocation
@@ -53,7 +55,7 @@ jax.config.update("jax_compiler_enable_remat_pass", True)
 jax.config.update("jax_compilation_cache_dir", "/tmp/jax-cache")
 jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
 jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
-# jax.config.update("jax_persistent_cache_enable_xla_caches", "all")
+#jax.config.update("jax_persistent_cache_enable_xla_caches", "all")
 # # DEBUGGING BLOCK
 jax.config.update("jax_debug_nans", True)
 # jax.config.update("jax_debug_infs", True)
@@ -70,13 +72,20 @@ from jax import Array
 from jax.sharding import Mesh, NamedSharding
 from sparklines import sparklines
 from tqdm.auto import tqdm
-from utils import get_gpu_l2_cache_size, LOG_LEVELS
+from utils import (
+    AFSATConfig,
+    LOG_LEVELS,
+    get_gpu_l2_cache_size,
+)
+from var_mapper import VarMapper
+from samplers import sample_assignments, SUPPORTED_SAMPLE_METHODS
 
 from boolean_whf import Objective
 from sat_loader import PBSATFormula
 from solvers import Optimiser, build_eval_verify, seq_eval_verify
 
 logger = logging.getLogger(__name__)
+QUIT_ON_ANOMALY = False
 # fh = logging.FileHandler(filename="jax.log")
 # fh.setLevel(logging.DEBUG)
 # logging.basicConfig(level=logging.INFO)
@@ -94,67 +103,6 @@ if jax.__version_info__[1] < 7:
     jax.P = jax.sharding.PartitionSpec
 print = functools.partial(print, flush=True)
 ShardSpec: TypeAlias = tuple[NamedSharding, tuple[NamedSharding, ...]]
-
-
-def x0_guesses(
-    rng_key: Array, batch: int, n_vars: int, method: str = "bias", prefixes: Array | None = None
-) -> tuple[Array, Array]:
-    """
-    Generates initial guesses for variable assignments in SAT problems using different randomization methods.
-
-    Args:
-        rng_key (Array): JAX PRNG key for random number generation.
-        batch (int): Number of guess vectors to generate.
-        n_vars (int): Number of variables in each guess vector.
-        method (str, optional): Method for generating guesses. Options are:
-            - "bias" (default): Generates values biased towards False from a uniform distribution
-            - "coin": Generates using a biased (70% tending False) coin flip (Bernoulli).
-            - "uniform": Generates values uniformly between True and False
-        prefix_vectors (Array, optional): Shape (N, n_vars) where 0=no fix, ±1=fix to that value.
-                                        Will be replicated to fill batch size B, so each vector appears B//N times.
-
-    Returns:
-        Array: An array of shape (batch, n_vars) containing the generated initial guesses.
-
-    Raises:
-        ValueError: If an unsupported method is specified.
-    """
-
-    if method == "bias":
-        # Generate values biased towards 1 (False) while maintaining full [-1, 1] range
-        u = jax.random.uniform(rng_key, minval=0.0, maxval=1.0, shape=(batch, n_vars))
-        bias_strength = 0.5  # Lower value = stronger bias towards False
-        x0 = 2 * u**bias_strength - 1
-
-    elif method == "coin":
-        false_prob = 0.7  # Y% probability of generating values tending towards False
-        coin_key, rng_key = jax.random.split(rng_key)
-        biased_coins = jax.random.bernoulli(coin_key, p=false_prob, shape=(batch, n_vars))
-        signs = 2 * biased_coins - 1
-        magnitudes = jax.random.uniform(rng_key, minval=0.0, maxval=1.0, shape=(batch, n_vars))
-        x0 = signs * magnitudes
-
-    elif method == "uniform":
-        x0 = jax.random.uniform(rng_key, minval=-1, maxval=1, shape=(batch, n_vars))
-
-    elif method == "trunc":
-        x0 = jax.random.truncated_normal(rng_key, lower=-1, upper=1, shape=(batch, n_vars))
-
-    else:
-        raise ValueError(f"Unsupported method: {method}")
-
-    # Fix positions of supplied prefixes.
-    fixed_mask = jnp.full((batch, 1), fill_value=False, dtype=bool)
-    if prefixes is not None:
-        N = prefixes.shape[0]
-        # Batch is already correctly sized equal points for each prefix.
-        replicated_prefixes = jnp.repeat(prefixes, batch // N, axis=0)
-
-        # Non-zero points are fixed, so adjust batch and disable gradients there.
-        fixed_mask = replicated_prefixes != 0
-        x0 = jnp.where(fixed_mask, replicated_prefixes, x0)
-
-    return x0, fixed_mask
 
 
 @overload
@@ -237,27 +185,36 @@ def adjust_batch(devices: list, batch: int, target: int, est_mem_per_point: int,
 
 
 def run_solver(
-    timeout: int,
+    config: AFSATConfig,
     n_vars: int,
     n_clause: int,
-    batch: int,
-    restart_thresh: int,
-    fuzz_limit: int,
     objs: tuple[Objective, ...],
-    n_devices: int = 1,
-    sample_method: str = "bias",
-    optimiser: str = "pgd",
-    warmup: bool = False,
-    benchmark: bool = False,
-    counting: int = 0,
-    rand_seed: bool = False,
     prefix_vectors: Array | None = None,
-    maxiters: int = 100,
-    weight_decay: float = 0.9, #alpha,
-    unsat_h: int = 0,
-    solver_tol: float = 1e-3,
-    binary_v: bool = False
+    *,
+    var_mapper: VarMapper,
 ) -> float:
+    runtime_common = config.runtime_common
+    runtime_afsat = config.runtime_afsat
+    optimiser_cfg = config.optimiser
+    output_cfg = config.output_logging
+
+    timeout = runtime_common.timeout_sec
+    batch = runtime_afsat.batch_per_device
+    restart_thresh = runtime_common.restart_interval
+    fuzz_limit = runtime_afsat.fuzz
+    n_devices = runtime_common.n_devices
+    sample_method = runtime_common.sample_method
+    optimiser = optimiser_cfg.name
+    warmup = runtime_afsat.warmup
+    benchmark = runtime_common.benchmark
+    counting = int(runtime_common.counting)
+    rand_seed = runtime_common.rand_seed
+    maxiters = optimiser_cfg.max_iters
+    weight_decay = runtime_common.weight_decay
+    unsat_h = int(runtime_common.unsat_thresh * 2 * n_vars) if runtime_common.unsat_thresh else 0
+    solver_tol = optimiser_cfg.tolerance
+    binary_v = output_cfg.binary_v
+
     devices = jax.devices("gpu")[:n_devices]
     n_prefix = len(prefix_vectors) if prefix_vectors is not None else 1
 
@@ -346,8 +303,8 @@ def run_solver(
             logger.info(f"W-XT {warm_end - warm_start}")
             return warm_end - warm_start
 
-    all_sols: dict[tuple, int] = defaultdict(int)
-    first_sol: tuple | None = None
+    all_sols: dict[tuple[int, ...], int] = defaultdict(int)
+    first_sol: tuple[int, ...] | None = None
     best_x = np.zeros((n_vars))
     ttfs = 0
     best_unsat = jnp.inf
@@ -389,7 +346,7 @@ def run_solver(
         # Randomisation & Init
         key, s_key = jax.random.split(key)
         f_key, s_f_key = jax.random.split(f_key)
-        x0, fixed_vars = x0_guesses(s_key, batch, n_vars, sample_method, prefix_vectors)
+        x0, fixed_vars = sample_assignments(s_key, batch, n_vars, sample_method, prefix_vectors)
         x0_dev = jax.device_put(x0.copy(), batch_sharding)
         fixed_vars = jax.device_put(fixed_vars, batch_sharding)
 
@@ -529,7 +486,8 @@ def run_solver(
 
         if found_sol:
             first_sol = tuple(np.sign(best_x).astype(int).tolist())
-            sol_locs = jnp.argwhere(jnp.where(opt_unsat_ct < 1, 1, 0)).flatten().tolist()
+            sol_locs: list[int] = jnp.argwhere(jnp.where(opt_unsat_ct < 1, 1, 0)).flatten().tolist()
+            batch_sols: list[tuple[int, ...]]
             batch_sols = [tuple(row.astype(int).tolist()) for row in np.sign(np.asarray(opt_x0[sol_locs, :]))]
             if counting:
                 for sol in batch_sols:
@@ -671,13 +629,8 @@ def run_solver(
         for sol_i, sol in enumerate(all_sols.keys()):
             if not counting and first_sol != sol:
                 continue
-            sol_str_d = []
-            sol_str_b = []
-            for var, assigned in enumerate(np.sign(sol).astype(int)):
-                lit = (var + 1) * assigned # assigned=-1 means "True"
-                sol_str_d.append(f"{-lit}")
-                sol_str_b.append("0" if assigned > 0 else "1")
-            sol_str = "".join(sol_str_b) if binary_v else " ".join(sol_str_d)
+            sol_str = var_mapper.assn_str(sol, binary_v)
+            #var_mapper.bin_str(sol) if binary_v else var_mapper.lits_str(sol)
             if counting:
                 logger.info(f"{sol_i+1}: v {sol_str} 0")
                 if not sol_i:
@@ -687,24 +640,20 @@ def run_solver(
                 print(f"v {sol_str} 0")
                 break
     else:
-        assign_str_d = []
-        assign_str_b = []
-        assignment = []
-        pr_signs = ["?", "-", ""]
-        for var, assigned in enumerate(np.sign(best_x).astype(int)):
-            lit = var + 1
-            assign_str_d.append(f"{pr_signs[int(assigned)]}{lit}")
-            assign_str_b.append("0" if assigned > 0 else ("1" if assigned < 0 else "-"))
-            if assigned:
-                assignment.append(lit * -assigned)
-        assign_str = "".join(assign_str_b) if binary_v else " ".join(assign_str_d)
+        signed_best = tuple(np.sign(best_x).astype(int).tolist())
+        assign_str = var_mapper.assn_str(signed_best, binary_v, inc_zero=True)
+        #var_mapper.bin_str(signed_best) if binary_v else var_mapper.lits_str(signed_best, include_unknown=True)
 
         print("s UNKNOWN")
         print("c Best found MAX-SAT assignment (zero energy variables omitted or -):")
         print(f"o {best_unsat}")
         print(f"v {assign_str} 0")
 
-        assignment = set(assignment)
+        assignment = {
+            var_mapper.map_to_input(var_idx_0 + 1) * -assigned
+            for var_idx_0, assigned in enumerate(signed_best)
+            if assigned
+        }
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug("UNSATS (set literals-clause literals):\n")
             for i, cl_idx in enumerate(best_unsat_clauses_idx.flatten()):
@@ -713,9 +662,10 @@ def run_solver(
                     obj_len = obj.clauses.lits.shape[0]
                     if find_idx < obj_len:
                         if len(obj.clauses.sign.shape) > 1:
-                            clause = set(((obj.clauses.lits[find_idx] + 1) * obj.clauses.sign[find_idx]).tolist())
+                            dense_clause = ((obj.clauses.lits[find_idx] + 1) * obj.clauses.sign[find_idx]).tolist()
                         else:
-                            clause = set(((obj.clauses.lits[find_idx] + 1) * obj.clauses.sign).tolist())
+                            dense_clause = ((obj.clauses.lits[find_idx] + 1) * obj.clauses.sign).tolist()
+                        clause = set(var_mapper.map_to_input(int(lit)) for lit in dense_clause if lit)
                         logger.debug(f"{(sorted(clause.intersection(assignment)), clause)}")
                         break
                     else:
@@ -728,6 +678,8 @@ def run_solver(
         if ttfs:
             logger.info(f"X-TTFS {ttfs}")
         logger.info("START EXP")
+        logger.info(f"X-CLAUSES {n_clause}")
+        logger.info(f"X-VARS {n_vars}")
         logger.info(f"X-GPU {n_devices}")
         logger.info(f"X-PPBATCH {batch}")
         logger.info(f"X-PPGPUBATCH {batch // n_devices} PPBATCH/GPU")
@@ -755,61 +707,36 @@ def run_solver(
     return tsolve
 
 
-def main(
-    file: str,
-    timeout: int,
-    batch: int = -1,
-    restart_thresh: int = 0,
-    fuzz: int = 0,
-    n_devices: int = 1,
-    disk_cache: str = "",
-    benchmark: bool = False,
-    counting: int = 0,
-    warmup: bool = False,
-    rand_seed: bool = False,
-    prefix_file: str = "",
-    maxiters: int = 100,
-    unsat_h: float = 0,
-    sample_method: str = "bias",
-    solver_tol: float = 1e-3,
-    optimiser: str = "pgd",
-    binary_v: bool = False
-) -> None:
-    if not file:
+def main(problem_file: str, config: AFSATConfig) -> None:
+    if not problem_file:
         raise ValueError("No problem file specified")
+
     stamp1 = time()
-    sat_parser = PBSATFormula(workers=4, n_devices=n_devices, disk_cache=disk_cache, file=file, compactify=False)
+    sat_parser = PBSATFormula(
+        workers=4,
+        n_devices=config.runtime_common.n_devices,
+        disk_cache=config.invocation.disk_cache,
+        file=problem_file,
+        compactify=False
+    )
     stamp2 = time()
     read_time = stamp2 - stamp1
 
     objectives = sat_parser.process_clauses_to_array()
     n_var = sat_parser.n_var
     n_clause = sat_parser.n_clause
-    prefixes = sat_parser.process_prefix(prefix_file)
+    prefixes = sat_parser.process_prefix(config.invocation.prefix_file)
     prefixes = jnp.array(prefixes) if prefixes is not None else None
     stamp1 = time()
     process_time = stamp1 - stamp2
 
     t_solve = run_solver(
-        timeout,
+        config,
         n_var,
         n_clause,
-        batch,
-        restart_thresh,
-        fuzz,
         objectives,
-        n_devices=n_devices,
-        counting=counting,
-        rand_seed=rand_seed,
-        benchmark=benchmark,
-        warmup=warmup,
         prefix_vectors=prefixes,
-        maxiters=maxiters,
-        unsat_h=int(unsat_h * 2 * n_var) if unsat_h else 0,
-        sample_method=sample_method,
-        solver_tol=solver_tol,
-        optimiser=optimiser,
-        binary_v=binary_v,
+        var_mapper=sat_parser.var_mapper,
     )
 
     logger.info(f"Time reading input: {read_time}")
@@ -827,73 +754,84 @@ if __name__ == "__main__":
         + "JAX_LOGGING_LEVEL=DEBUG TF_CPP_MIN_LOG_LEVEL=[X] TF_CPP_MAX_VLOG_LEVEL=[X]"
         + "JAX_TRACEBACK_FILTERING=off",
     )
-    ap.add_argument("file", help="The file to process")
-    ap.add_argument("-y", "--profile", action="store_true", help="Enable profiling")
-    ap.add_argument("-t", "--timeout", type=int, default=300, help="Maximum runtime (timeout seconds)")
-    ap.add_argument("-b", "--batch", type=int, default=-1, help="Batch size. -1 computes heuristic maximum")
-    ap.add_argument("-f", "--fuzz", type=int, default=0, help="Number of times to attempt fuzzing per batch")
-    ap.add_argument("-r", "--restart_thresh", type=int, default=1, help="Batches before reweighting (never if 0)")
-    ap.add_argument("-n", "--n_devices", type=int, default=n_devices, help="Devices (eg. GPUs) to use. 0 uses all")
-    ap.add_argument("-e", "--benchmark", action="store_true", default=True, help="Benchmark mode (reduce output)")
-    ap.add_argument("--progress", action="store_false", dest="benchmark", help="Display progress stats (equiv to -e False)")
-    ap.add_argument("-c", "--counting", action="store_true", help="Counting mode. Count solns until timeout")
-    ap.add_argument("-w", "--warmup", action="store_true", help="Perform a warmup run before starting timer")
-    ap.add_argument("-d", "--debug", choices=LOG_LEVELS, default="ERROR", help=f"Set logging level ({LOG_LEVELS})")
-    ap.add_argument("-s", "--rand_seed", action="store_true", help="Randomise seed")
-    ap.add_argument("-p", "--prefix", type=str, default="", help="Fixed assignments file, each a line of assigned vars")
-    ap.add_argument("-i", "--iters_desc", type=int, default=100, help="Solver maximum iterations")
-    ap.add_argument("-u", "--unsat_thresh", type=float, default=0, help="Stop when #UNSAT drops below threshold (PLE)")
-    ap.add_argument("-m", "--sample_meth", type=str, default="bias", help="Starting point sampler (bias,coin,uniform)")
-    ap.add_argument("-q", "--solver_tol", type=float, default=1e-3, help="Optimiser convergence tolerance (if supported)")
-    ap.add_argument("-o", "--optimiser", "--optimizer", dest="optimiser", type=str, default="pgd", help="Optimiser")
-    ap.add_argument("--stdout_log", action="store_true", help="Send log output to stdout instead of stderr")
-    ap.add_argument("--anomaly_quit", action="store_true", default=False)
-    ap.add_argument("--log_propagate", action="store_true", default=False)
-    ap.add_argument("--binary_v", action="store_true", default=False, help="Short form solution string")
+    ap.add_argument("problem_file", help="The file to process")
+    ap.add_class_arguments(AFSATConfig, nested_key="config")
+    ap.set_defaults(**{"config.runtime_common.n_devices": n_devices})
+    ap.link_arguments(
+        "config.runtime_common.benchmark",
+        "config.runtime_common.progress_enabled",
+        compute_fn=lambda benchmark: not benchmark,
+        apply_on="parse",
+    )
 
-    arg = ap.parse_args()
-    logger.info(f"{arg._get_args()}")
+    def make_option_group(title: str, section: str):
+        group = ap.add_argument_group(title)
 
-    # TODO: This should not be a psuedo-global like this???
-    QUIT_ON_ANOMALY: bool = arg.anomaly_quit
+        def add_opt(*flags: str, field: str, **kwargs) -> None:
+            kwargs.setdefault("default", SUPPRESS)
+            group.add_argument(*flags, dest=f"config.{section}.{field}", **kwargs)
 
+        return add_opt
 
-    if not arg.n_devices:
-        arg.n_devices = n_devices
+    # Backward-compatible short aliases grouped by config sections.
+    io_opts = make_option_group("IO Aliases", "invocation")
+    io_opts("-y", "--profile", action="store_true", field="profile_enabled", help="Enable profiling")
+    io_opts("--cache", type=str, field="disk_cache", help="Disk cache for FFT matrices")
+    io_opts("-p", "--prefix", type=str, field="prefix_file", help="Fixed assignments file, each a line of assigned vars")
 
-    logger.propagate = True #arg.log_propagate
+    runtime_common_opts = make_option_group("Runtime Common Aliases", "runtime_common")
+    runtime_common_opts("-t", "--timeout", type=int, field="timeout_sec", help="Maximum runtime (timeout seconds)")
+    runtime_common_opts("-r", "--restart_thresh", type=int, field="restart_interval", help="Batches before reweighting (never if 0)")
+    runtime_common_opts("-n", "--n_devices", type=int, field="n_devices", help="Devices (eg. GPUs) to use. 0 uses all")
+    runtime_common_opts("-e", "--benchmark", action="store_true", field="benchmark", help="Benchmark mode (reduce output)")
+    runtime_common_opts("--progress", action="store_false", field="benchmark", help="Display progress stats (equiv to -e False)")
+    runtime_common_opts("-c", "--counting", action="store_true", field="counting", help="Counting mode. Count solns until timeout")
+    runtime_common_opts("-s", "--rand_seed", action="store_true", field="rand_seed", help="Randomise seed")
+    runtime_common_opts("-u", "--unsat_thresh", type=float, field="unsat_thresh", help="Stop when #UNSAT drops below threshold (PLE)")
+    runtime_common_opts("-m", "--sample_meth", type=str, field="sample_method", choices=SUPPORTED_SAMPLE_METHODS, help="Starting point sampler")
+
+    runtime_afsat_opts = make_option_group("Runtime AFSAT Aliases", "runtime_afsat")
+    runtime_afsat_opts("-b", "--batch", type=int, field="batch_per_device", help="Batch size. -1 computes heuristic maximum")
+    runtime_afsat_opts("-f", "--fuzz", type=int, field="fuzz", help="Number of times to attempt fuzzing per batch")
+    runtime_afsat_opts("-w", "--warmup", action="store_true", field="warmup", help="Perform a warmup run before starting timer")
+
+    optimiser_opts = make_option_group("Optimiser Aliases", "optimiser")
+    optimiser_opts("-i", "--iters_desc", type=int, field="max_iters", help="Solver maximum iterations")
+    optimiser_opts("-q", "--solver_tol", type=float, field="tolerance", help="Optimiser convergence tolerance (if supported)")
+    optimiser_opts("-o", "--optimiser", "--optimizer", type=str, field="name", help="Optimiser")
+
+    output_opts = make_option_group("Output Aliases", "output_logging")
+    output_opts("-d", "--debug", choices=LOG_LEVELS, field="debug_level", help=f"Set logging level ({LOG_LEVELS})")
+    output_opts("--stdout_log", action="store_true", field="stdout_log", help="Send log output to stdout instead of stderr")
+    output_opts("--anomaly_quit", action="store_true", field="anomaly_quit")
+    output_opts("--log_propagate", action="store_true", field="log_propagate")
+    output_opts("--binary_v", action="store_true", field="binary_v", help="Short form solution string")
+
+    parsed = ap.parse_args()
+    instantiated = ap.instantiate(parsed)
+    config = instantiated.config
+    config.runtime_common.n_devices = config.runtime_common.n_devices or n_devices
+
+    QUIT_ON_ANOMALY = config.output_logging.anomaly_quit
+    logger.propagate = config.output_logging.log_propagate
     logging.basicConfig(
-        level=getattr(logging, arg.debug.upper()),
+        level=getattr(logging, config.output_logging.debug_level.upper()),
         # format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
         format="c %(name)s - %(levelname)s - %(message)s",
         handlers=[
-            logging.StreamHandler(sys.stdout if arg.stdout_log else sys.stderr),
+            logging.StreamHandler(sys.stdout if config.output_logging.stdout_log else sys.stderr),
             # Optional: logging.FileHandler('sat_loader.log')  # Also log to file
         ],
     )
 
     # Run with or without profiler based on the flag
-    profiler = jax.profiler.trace("/tmp/jax-trace", create_perfetto_link=False) if arg.profile else nullcontext()
+    profiler = (
+        jax.profiler.trace("/tmp/jax-trace", create_perfetto_link=False)
+        if config.invocation.profile_enabled
+        else nullcontext()
+    )
     with profiler:
-        main(
-            arg.file,
-            arg.timeout,
-            arg.batch,
-            arg.restart_thresh,
-            arg.fuzz,
-            arg.n_devices,
-            benchmark=arg.benchmark,
-            counting=arg.counting,
-            warmup=arg.warmup,
-            rand_seed=arg.rand_seed,
-            prefix_file=arg.prefix,
-            maxiters=arg.iters_desc,
-            unsat_h=arg.unsat_thresh,
-            sample_method=arg.sample_meth,
-            solver_tol=arg.solver_tol,
-            optimiser=arg.optimiser,
-            binary_v=arg.binary_v
-        )
-        if arg.profile:
+        main(parsed.problem_file, config)
+        if config.invocation.profile_enabled:
             jax.profiler.save_device_memory_profile("memory.prof")
-    logger.debug(f"Running with configuration: {arg}")
+    logger.debug(f"Running with configuration: {config}")

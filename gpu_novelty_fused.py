@@ -14,9 +14,12 @@ import logging
 import math
 import os
 import sys
-from argparse import ArgumentParser as ArgParse
+#from argparse import ArgumentParser as ArgParse
+from argparse import SUPPRESS
 from time import perf_counter as time
 from typing import NamedTuple
+
+from jsonargparse import ArgumentParser as ArgParse
 
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 os.environ["XLA_CLIENT_MEM_FRACTION"] = "0.95"
@@ -44,7 +47,13 @@ import numpy as np
 from jax import Array
 from jax.sharding import Mesh, NamedSharding
 from tqdm.auto import tqdm
-from utils import get_gpu_l2_cache_size, LOG_LEVELS
+from utils import (
+    LOG_LEVELS,
+    NoveltyConfig,
+    get_gpu_l2_cache_size,
+)
+from var_mapper import VarMapper
+from samplers import sample_assignments, SUPPORTED_SAMPLE_METHODS
 
 from boolean_whf import ClauseArrays, clause_type_ids
 from sat_loader import PBSATFormula
@@ -155,6 +164,7 @@ def make_gpu_inner_loop(
     all_fixed_masks: Array | None = None,
     all_prefix_bools: Array | None = None,
     n_prefix: int = 0,
+    sample_method: str = "bias",
 ):
     """Factory to create GPU inner loop with constants closed over.
 
@@ -181,15 +191,15 @@ def make_gpu_inner_loop(
         n_keep_pg = ppg - n_cull_pg
 
     # Host-side solution collection
-    collected_solutions: list[np.ndarray] = []
+    collected_solutions: list[tuple[bool, ...]] = []
 
     def host_collect_solutions(potential_sols: np.ndarray, sol_indices: np.ndarray) -> None:
         """Host callback - extracts actual solutions using sentinel-based filtering."""
         for i, idx in enumerate(sol_indices):
             if idx >= 0:
-                collected_solutions.append(potential_sols[i].copy())
+                collected_solutions.append(tuple(potential_sols[i].tolist()))
 
-    def get_solutions() -> list[np.ndarray]:
+    def get_solutions() -> list[tuple[bool, ...]]:
         return collected_solutions
 
     def clear_solutions() -> None:
@@ -225,7 +235,8 @@ def make_gpu_inner_loop(
         kept = expanded[sorted_idx[:n_keep]]
 
         if n_cull > 0:
-            random_fill = jax.random.bernoulli(fill_key, p=0.5, shape=(n_cull, n_vars))
+            random_fill, _ = sample_assignments(fill_key, n_cull, n_vars, sample_method)
+            random_fill = random_fill < 0
             if single_prefix:
                 assert fixed_mask_1d is not None and prefix_bools_1d is not None
                 random_fill = jnp.where(fixed_mask_1d, prefix_bools_1d, random_fill)
@@ -303,7 +314,8 @@ def make_gpu_inner_loop(
                     sorted_idx = jnp.argsort(scores)
                     kept = g_exp[sorted_idx[:n_keep_pg]]
                     if n_cull_pg > 0:
-                        fill = jax.random.bernoulli(g_fkey, p=0.5, shape=(n_cull_pg, n_vars))
+                        fill, _ = sample_assignments(g_fkey, n_cull_pg, n_vars, sample_method)
+                        fill = fill < 0
                         fill = jnp.where(g_fixed, g_bools, fill)
                         return jnp.concatenate([kept, fill], axis=0)
                     return kept
@@ -372,26 +384,39 @@ def make_gpu_inner_loop(
 
 
 def run_beam_search(
-    timeout: int,
+    config: NoveltyConfig,
     n_vars: int,
     n_clauses: int,
-    batch_size: int,
     cls: tuple[ClauseArrays, ...],
-    n_devices: int = 1,
-    max_iters: int = 0,
-    rand_seed: bool = False,
-    counting: bool = False,
-    top_m: int = 1,
-    beta: float = 0.0,
-    restart_thresh: int = 0,
-    weight_decay: float = 0.9,
     prefixes: np.ndarray | None = None,
-    binary_v: bool = False,
-    var_mapper: VarMapper = None,
-    benchmark: bool = False,
-    unsat_h: int = 0
+    *,
+    var_mapper: VarMapper,
 ) -> float:
     """Run parallel beam search SAT solver with fused GPU inner loop."""
+
+    runtime_common = config.runtime_common
+    runtime_novelty = config.runtime_novelty
+    optimiser_cfg = config.optimiser
+    output_cfg = config.output_logging
+
+    timeout = runtime_common.timeout_sec
+    batch_size = runtime_novelty.beam_per_device
+    n_devices = runtime_common.n_devices
+    max_iters = optimiser_cfg.max_iters
+    restart_thresh = runtime_common.restart_interval
+    sample_method = runtime_common.sample_method
+    unsat_h = (
+        int(runtime_common.unsat_thresh * n_clauses)
+        if runtime_common.unsat_thresh
+        else 0
+    )
+    rand_seed = runtime_common.rand_seed
+    counting = runtime_common.counting
+    top_m = runtime_novelty.top_m
+    beta = runtime_novelty.beta
+    weight_decay = runtime_common.weight_decay
+    benchmark = runtime_common.benchmark
+    binary_v = output_cfg.binary_v
 
     # Initialize devices and mesh
     devices = jax.devices("gpu")[:n_devices]
@@ -498,10 +523,12 @@ def run_beam_search(
         all_fixed_masks=all_fixed_masks if multi_prefix else None,
         all_prefix_bools=all_prefix_bools if multi_prefix else None,
         n_prefix=n_prefix,
+        sample_method=sample_method,
     )
 
     # Initialize points
-    points = jax.random.bernoulli(init_key, p=0.5, shape=(batch_size * top_m, n_vars))
+    points, _ = sample_assignments(init_key, batch_size * top_m, n_vars, sample_method)
+    points = points < 0
 
     # Apply prefix values to initial points
     if single_prefix:
@@ -561,6 +588,7 @@ def run_beam_search(
 
     t0 = time()
     last_update = t0
+    ttfs = 0
 
     # Compile inner loop once (weights are dynamic via BeamState)
     gpu_loop = make_inner_loop(inner_iters)
@@ -700,7 +728,6 @@ def run_beam_search(
         logger.info(f"X-RAWITER {[total_iters]}")
         logger.info(f"X-RAWUNSAT {all_unsats}")
         logger.info(f"X-BEAM {batch_size}")
-        logger.info(f"X-BEST_UNSAT {best_unsat_val}")
         logger.info("END EXP")
 
     return solve_time
@@ -711,26 +738,18 @@ def run_beam_search(
 # =============================================================================
 
 
-def main(
-    file: str,
-    timeout: int,
-    batch_size: int = -1,
-    n_devices: int = 1,
-    disk_cache: str = "",
-    counting: bool = False,
-    rand_seed: bool = False,
-    max_iters: int = 0,
-    top_m: int = 1,
-    beta: float = 0.0,
-    restart_thresh: int = 0,
-    weight_decay: float = 0.9,
-    prefix_file: str = "",
-    benchmark: bool = False,
-    unsat_h: float = 0.0,
-) -> None:
+def main(problem_file: str, config: NoveltyConfig) -> None:
     """Main entry point."""
+    if not problem_file:
+        raise ValueError("No problem file specified")
+
     stamp1 = time()
-    sat_parser = PBSATFormula(workers=4, n_devices=n_devices, disk_cache=disk_cache, file=file)
+    sat_parser = PBSATFormula(
+        workers=4,
+        n_devices=config.runtime_common.n_devices,
+        disk_cache=config.invocation.disk_cache,
+        file=problem_file,
+    )
     stamp2 = time()
     read_time = stamp2 - stamp1
 
@@ -742,31 +761,20 @@ def main(
 
     # Process prefixes (includes unit literals from DIMACS parsing).
     prefixes: np.ndarray | None = None
-    if prefix_file or sat_parser.unit_prefix:
-        prefixes = sat_parser.process_prefix(prefix_file)
+    if config.invocation.prefix_file or sat_parser.unit_prefix:
+        prefixes = sat_parser.process_prefix(config.invocation.prefix_file)
         assert prefixes is not None
         n_prefix = prefixes.shape[0]
         n_fixed = np.count_nonzero(prefixes[0]) if n_prefix == 1 else [np.count_nonzero(p) for p in prefixes]
-        print(f"Prefix: {n_prefix} vector(s), fixed vars: {n_fixed} / {n_var}")
+        logger.info(f"Prefix: {n_prefix} vector(s), fixed vars: {n_fixed} / {n_var}")
 
     t_solve = run_beam_search(
-        timeout,
+        config,
         n_var,
         n_clause,
-        batch_size,
         cls,
-        n_devices=n_devices,
-        max_iters=max_iters,
-        rand_seed=rand_seed,
-        counting=counting,
-        top_m=top_m,
-        beta=beta,
-        restart_thresh=restart_thresh,
-        weight_decay=weight_decay,
         prefixes=prefixes,
         var_mapper=sat_parser.var_mapper,
-        benchmark=benchmark,
-        unsat_h=int(unsat_h * 2 * n_var) if unsat_h else 0
     )
 
     logger.info(f"Time reading input: {read_time}")
@@ -779,48 +787,77 @@ if __name__ == "__main__":
     logger.info(jax.devices("gpu"))
 
     parser = ArgParse(description="GPU Beam Search SAT Solver (Fused)")
-    parser.add_argument("file", type=str, help="Input file (.cnf, .hybrid, .opb)")
-    parser.add_argument("-t", "--timeout", type=int, default=300, help="Timeout in seconds")
-    parser.add_argument("-b", "--beam", type=int, default=-1, help="Beam width (-1 for auto)")
-    parser.add_argument("-g", "--gpus", type=int, default=n_devices, help="Number of GPUs")
-    parser.add_argument("-i", "--iters", type=int, default=0, help="Max iterations (0=unlimited)")
-    parser.add_argument("-c", "--counting", action="store_true", help="Count solutions mode")
-    parser.add_argument("-s", "--seed", action="store_true", help="Random seed from time")
-    parser.add_argument("--cache", type=str, default="", help="Disk cache for FFT matrices")
-    parser.add_argument("-v", "--verbose", action="store_true", help="Verbose logging")
-    parser.add_argument("-m", "--top-m", type=int, default=1, help="Top m neighbors per point")
-    parser.add_argument("--beta", type=float, default=0.1, help="Cull fraction (0.0-1.0)")
-    parser.add_argument("-r", "--restart", type=int, default=1, help="Reweight interval (0=never)")
-    parser.add_argument("-a", "--alpha", type=float, default=0.9, help="Weight decay (0.0-1.0)")
-    parser.add_argument("-p", "--prefix", type=str, default="", help="Prefix file (fixed variable assignments)")
-    parser.add_argument("-e", "--benchmark", action="store_true", default=True, help="Benchmark mode (reduce output)")
-    parser.add_argument("--progress", action="store_false", dest="benchmark", help="Display progress stats (equiv to -e False)")
-    parser.add_argument("-d", "--debug", choices=LOG_LEVELS, default="ERROR", help=f"Set logging level ({LOG_LEVELS})")
-    parser.add_argument("--stdout_log", action="store_true", help="Send log output to stdout instead of stderr")
-    parser.add_argument("--binary_v", action="store_true", default=False, help="Short form solution string")
-    parser.add_argument("-u", "--unsat_thresh", type=float, default=0, help="Stop when #UNSAT drops below threshold (PLE)")
+    parser.add_argument("problem_file", type=str, help="Input file (.cnf, .hybrid, .opb)")
+    parser.add_class_arguments(NoveltyConfig, nested_key="config")
+    parser.set_defaults(
+        **{
+            "config.runtime_common.n_devices": n_devices,
+            "config.optimiser.name": "novelty",
+            "config.optimiser.max_iters": 0,
+        }
+    )
+    parser.link_arguments(
+        "config.runtime_common.benchmark",
+        "config.runtime_common.progress_enabled",
+        compute_fn=lambda benchmark: not benchmark,
+        apply_on="parse",
+    )
 
+    def make_option_group(title: str, section: str):
+        group = parser.add_argument_group(title)
+
+        def add_opt(*flags: str, field: str, **kwargs) -> None:
+            kwargs.setdefault("default", SUPPRESS)
+            group.add_argument(*flags, dest=f"config.{section}.{field}", **kwargs)
+
+        return add_opt
+
+    # Backward-compatible short aliases grouped by config sections.
+    io_opts = make_option_group("IO Aliases", "invocation")
+    io_opts("--cache", type=str, field="disk_cache", help="Disk cache for FFT matrices")
+    io_opts("-p", "--prefix", type=str, field="prefix_file", help="Prefix file (fixed variable assignments)")
+
+    runtime_common_opts = make_option_group("Runtime Common Aliases", "runtime_common")
+    runtime_common_opts("-t", "--timeout", type=int, field="timeout_sec", help="Timeout in seconds")
+    runtime_common_opts("-g", "--gpus", type=int, field="n_devices", help="Number of GPUs")
+    runtime_common_opts("-c", "--counting", action="store_true", field="counting", help="Count solutions mode")
+    runtime_common_opts("-s", "--seed", action="store_true", field="rand_seed", help="Random seed from time")
+    runtime_common_opts("--sample_meth", type=str, field="sample_method", choices=SUPPORTED_SAMPLE_METHODS, help="Sampling method for init/refill")
+    runtime_common_opts("-r", "--restart", type=int, field="restart_interval", help="Reweight interval (0=never)")
+    runtime_common_opts("-a", "--alpha", type=float, field="weight_decay", help="Weight decay (0.0-1.0)")
+    runtime_common_opts("-e", "--benchmark", action="store_true", field="benchmark", help="Benchmark mode (reduce output)")
+    runtime_common_opts("--progress", action="store_false", field="benchmark", help="Display progress stats")
+    runtime_common_opts("-u", "--unsat_thresh", type=float, field="unsat_thresh", help="Stop when #UNSAT drops below threshold fraction")
+
+    runtime_novelty_opts = make_option_group("Runtime Novelty Aliases", "runtime_novelty")
+    runtime_novelty_opts("-b", "--beam", type=int, field="beam_per_device", help="Beam width (-1 for auto)")
+    runtime_novelty_opts("-m", "--top-m", type=int, field="top_m", help="Top m neighbors per point")
+    runtime_novelty_opts("--beta", type=float, field="beta", help="Cull fraction (0.0-1.0)")
+
+    optimiser_opts = make_option_group("Optimiser Aliases", "optimiser")
+    optimiser_opts("-i", "--iters", type=int, field="max_iters", help="Max iterations (0=unlimited)")
+
+    output_opts = make_option_group("Output Aliases", "output_logging")
+    output_opts("-d", "--debug", choices=LOG_LEVELS, field="debug_level", help=f"Set logging level ({LOG_LEVELS})")
+    output_opts("--binary_v", action="store_true", field="binary_v", help="Short form solution string")
+    output_opts("--stdout_log", action="store_true", field="stdout_log", help="Send log output to stdout instead of stderr")
+    
     args = parser.parse_args()
+    instantiated = parser.instantiate(args)
+    config = instantiated.config
+    config.runtime_common.n_devices = config.runtime_common.n_devices or n_devices
+
     logging.basicConfig(
-        level=getattr(logging, args.debug.upper()),
+        level=getattr(logging, config.output_logging.debug_level.upper()),
+        # format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
         format="c %(name)s - %(levelname)s - %(message)s",
-        handlers=[logging.StreamHandler(sys.stdout if args.stdout_log else sys.stderr)],
+        handlers=[
+            logging.StreamHandler(sys.stdout if config.output_logging.stdout_log else sys.stderr),
+            # Optional: logging.FileHandler('sat_loader.log')  # Also log to file
+        ],
     )
 
-    main(
-        file=args.file,
-        timeout=args.timeout,
-        batch_size=args.beam,
-        n_devices=args.gpus,
-        disk_cache=args.cache,
-        counting=args.counting,
-        rand_seed=args.seed,
-        max_iters=args.iters,
-        top_m=args.top_m,
-        beta=args.beta,
-        restart_thresh=args.restart,
-        weight_decay=args.alpha,
-        prefix_file=args.prefix,
-        benchmark=args.benchmark,
-        unsat_h=args.unsat_thresh,
-    )
+    main(args.problem_file, config)
+
+    # flip in all direction * and * no flip. 
+    # keep some worst as well?

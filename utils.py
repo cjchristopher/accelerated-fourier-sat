@@ -3,9 +3,8 @@ from __future__ import annotations
 
 import json
 import logging
-import os
-from dataclasses import dataclass, field
-from typing import Any, Literal
+from dataclasses import asdict, dataclass, field
+from typing import Any
 
 LOG_LEVELS = ["DEBUG", "INFO", "WARNING", "ERROR"]
 
@@ -32,48 +31,123 @@ class LogThrottle:
                 self.logger.debug(f"... suppressed {suppressed} further '{key}' messages")
         self._counts.clear()
 
-# TODO: Implement config file passing and setting instead of all command line switches.
 @dataclass
-class FFSATConfig:
-    """Configuration for FFSAT solver."""
+class InvocationIOConfig:
+    """Invocation-level and IO inputs for a solve run."""
 
-    # Solver configuration
-    solver_type: Literal["pgd", "hj_prox"] = "pgd"
-    solver_params: dict[str, Any] = field(
-        default_factory=lambda: {
-            "maxiter": 50000,
-            "projection": "box",
-            "projection_params": (-1, 1),
-        }
-    )
+    prefix_file: str = ""
+    disk_cache: str = ""
+    profile_enabled: bool = False
 
-    # Cache configuration
-    dft_cache: str = ""
 
-    # Run configuration
-    tasks: int = 32
-    batch_size: int = 16
-    max_time: float = 300.0  # Max run time in seconds
-    timeout_behavior: Literal["early_stop", "continue_until_batch"] = "continue_until_batch"
+@dataclass
+class RuntimeCommonConfig:
+    """Runtime options shared by AFSAT and novelty routines."""
 
-    # Output configuration
-    verbose: bool = True
+    timeout_sec: int = 300
+    n_devices: int = 1
+    counting: bool = False
+    benchmark: bool = True
+    progress_enabled: bool = False
+    rand_seed: bool = False
+    unsat_thresh: float = 0.0
+    sample_method: str = "bias"
+    restart_interval: int = 0
+    weight_decay: float = 0.9
+
+
+@dataclass
+class RuntimeAFSATConfig:
+    """AFSAT-only runtime options."""
+
+    batch_per_device: int = -1
+    fuzz: int = 0
+    warmup: bool = False
+
+
+@dataclass
+class RuntimeNoveltyConfig:
+    """Novelty-only runtime options."""
+
+    beam_per_device: int = -1
+    top_m: int = 1
+    beta: float = 0.0
+
+
+@dataclass
+class OptimiserConfig:
+    """Optimiser and stopping controls."""
+
+    name: str = "pgd"
+    max_iters: int = 100
+    tolerance: float = 1e-3
+    projection_type: str = "box"
+    projection_bounds: tuple[float, float] = (-1.0, 1.0)
+
+
+@dataclass
+class OutputLoggingConfig:
+    """Output and logging controls."""
+
+    debug_level: str = "ERROR"
+    stdout_log: bool = False
+    log_propagate: bool = False
+    binary_v: bool = False
+    anomaly_quit: bool = False
+
+
+@dataclass
+class AFSATConfig:
+    """Top-level config for AFSAT runs."""
+
+    invocation: InvocationIOConfig = field(default_factory=InvocationIOConfig)
+    runtime_common: RuntimeCommonConfig = field(default_factory=RuntimeCommonConfig)
+    runtime_afsat: RuntimeAFSATConfig = field(default_factory=RuntimeAFSATConfig)
+    optimiser: OptimiserConfig = field(default_factory=OptimiserConfig)
+    output_logging: OutputLoggingConfig = field(default_factory=OutputLoggingConfig)
 
     @classmethod
-    def from_file(cls, filepath: str) -> "FFSATConfig":
-        """Load configuration from a JSON file."""
-        if not os.path.exists(filepath):
-            raise FileNotFoundError(f"Configuration file not found: {filepath}")
-
-        with open(filepath, "r") as f:
-            config_dict = json.load(f)
-
-        return cls(**config_dict)
+    def from_dict(cls, data: dict[str, Any]) -> "AFSATConfig":
+        """Load nested AFSAT config from a dictionary."""
+        return cls(
+            invocation=InvocationIOConfig(**data.get("invocation", {})),
+            runtime_common=RuntimeCommonConfig(**data.get("runtime_common", {})),
+            runtime_afsat=RuntimeAFSATConfig(**data.get("runtime_afsat", {})),
+            optimiser=OptimiserConfig(**data.get("optimiser", {})),
+            output_logging=OutputLoggingConfig(**data.get("output_logging", {})),
+        )
 
     def to_file(self, filepath: str) -> None:
-        """Save configuration to a JSON file."""
+        """Save nested AFSAT config to a JSON file."""
         with open(filepath, "w") as f:
-            json.dump(self.__dict__, f, indent=2)
+            json.dump(asdict(self), f, indent=2)
+
+
+@dataclass
+class NoveltyConfig:
+    """Top-level config for novelty runs."""
+
+    invocation: InvocationIOConfig = field(default_factory=InvocationIOConfig)
+    runtime_common: RuntimeCommonConfig = field(default_factory=RuntimeCommonConfig)
+    runtime_novelty: RuntimeNoveltyConfig = field(default_factory=RuntimeNoveltyConfig)
+    optimiser: OptimiserConfig = field(default_factory=OptimiserConfig)
+    output_logging: OutputLoggingConfig = field(default_factory=OutputLoggingConfig)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "NoveltyConfig":
+        """Load nested novelty config from a dictionary."""
+        return cls(
+            invocation=InvocationIOConfig(**data.get("invocation", {})),
+            runtime_common=RuntimeCommonConfig(**data.get("runtime_common", {})),
+            runtime_novelty=RuntimeNoveltyConfig(**data.get("runtime_novelty", {})),
+            optimiser=OptimiserConfig(**data.get("optimiser", {})),
+            output_logging=OutputLoggingConfig(**data.get("output_logging", {})),
+        )
+
+    def to_file(self, filepath: str) -> None:
+        """Save nested novelty config to a JSON file."""
+        with open(filepath, "w") as f:
+            json.dump(asdict(self), f, indent=2)
 
 
 def get_gpu_l2_cache_size(device) -> int | None:
@@ -118,3 +192,4 @@ def get_gpu_l2_cache_size(device) -> int | None:
         if key in gpu_name:
             return size
     return 32 * 1024 * 1024  # Conservative default
+
