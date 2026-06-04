@@ -354,16 +354,16 @@ def run_solver(
         x0_dev = jax.device_put(x0.copy(), batch_sharding)
         fixed_vars = jax.device_put(fixed_vars, batch_sharding)
 
-        if logger.isEnabledFor(logging.WARNING) and batches_done < 5:
-            print(f"c Initial Assigment (batch {batches_done}, point 0)", np.asarray(x0[0,:].copy().tolist()))
+        # if logger.isEnabledFor(logging.WARNING) and batches_done < 5:
+        #     print(f"c Initial Assigment (batch {batches_done}, point 0)", np.asarray(x0[0,:].copy().tolist()))
 
         # Run solver.
         opt_x0, opt_unsat, opt_iters, opt_unsat_ct, aux_info = solver.run(x0_dev, fixed_vars, weights)
         accum_time_descent += time() - tloop
 
-        if logger.isEnabledFor(logging.WARNING) and batches_done < 5:
-            print(f"c Final Assigment (batch {batches_done}, point 0)", np.asarray(opt_x0[0,:].copy().tolist()))
-            print("c DIFFERENT?", not all((x0[0,:] == opt_x0[0,:]).tolist()))
+        # if logger.isEnabledFor(logging.WARNING) and batches_done < 5:
+        #     print(f"c Final Assigment (batch {batches_done}, point 0)", np.asarray(opt_x0[0,:].copy().tolist()))
+        #     print("c DIFFERENT?", not all((x0[0,:] == opt_x0[0,:]).tolist()))
             # print(aux_info)
 
         # Flag and bail if we encounter anomalous behaviour
