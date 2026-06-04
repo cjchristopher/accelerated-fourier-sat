@@ -54,6 +54,7 @@ class PBSATFormula(object):
         disk_cache: str = "",
         file: str = "",
         compactify: bool = True,
+        xor_rref: bool = False,
     ) -> None:
         self.clause_sets: dict[ClauseSignature, Clauses] = {}
         self.n_devices: int = n_devices
@@ -67,6 +68,8 @@ class PBSATFormula(object):
         self.seen_max_var: int = 0
         self.seen_clauses: int = 0
         self._loaded_file: str | None = None
+        self.xor_rref: bool = xor_rref
+        self.xor_clause_sets: list[Clauses] = []
         if disk_cache:
             self.disk_cache = AFSAT_DFTCache(disk_cache)
 
@@ -378,8 +381,7 @@ class PBSATFormula(object):
         The method uses multithreading to process clause groups in parallel, with each
         group being transformed into an Objective by the ClauseProcessor.
         Returns:
-            tuple[Objective, ...]: A sorted tuple of Objective instances, ordered by
-                the number of literals in their clauses (ascending).
+            tuple[Objective, ...]: A tuple of Objective instances.
         Notes:
             - Using multiple workers with XLA's "all" persistent cache mode can cause
               cache conflicts. If persistent caching is enabled for all components,
@@ -400,8 +402,12 @@ class PBSATFormula(object):
         clause_grps: list[ClauseGroup] = list()
         singletons_by_len: dict[int, list[Singleton]] = dict()
         padded_group: list[Singleton] = list()
+        self.xor_clause_sets = []
 
         for set_signature, set_clauses in self.clause_sets.items():
+            if self.xor_rref and set_signature.type == "xor":
+                self.xor_clause_sets.append(set_clauses)
+
             # Gather singletons by common length for more efficient processing
             if len(set_clauses) == 1:
                 singletons_by_len.setdefault(set_signature.len, []).append(Singleton(set_signature, set_clauses[0]))
@@ -437,8 +443,9 @@ class PBSATFormula(object):
         # All is broken for some jaxopt optimizers however, so we don't use it. If we do, workers should be 1 to avoid
         # race conditions deep in XLA (see jax.config.update("jax_persistent_cache_enable_xla_caches", "all"))
         objectives = parallel_clause_process(clause_grps, workers=min(len(clause_grps), self.workers))
-        objectives = tuple(sorted(objectives, key=lambda x: x.clauses.lits.shape[-1]))
-        self.n_clause = sum([o.clauses.lits.shape[0] for o in objectives])
+        objectives = tuple(sorted(objectives, key=lambda x: int(x.clauses.lits.shape[-1])))
+
+        self.n_clause = int(sum(o.clauses.lits.shape[0] for o in objectives))
         return objectives
 
     def process_prefix(self, prefix_file: str) -> NDArray | None:

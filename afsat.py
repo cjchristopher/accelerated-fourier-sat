@@ -81,7 +81,8 @@ from var_mapper import VarMapper
 from samplers import sample_assignments, SUPPORTED_SAMPLE_METHODS
 
 from boolean_whf import Objective
-from sat_loader import PBSATFormula
+from xor_rref import XorRREFMetadata, build_xor_rref_metadata_from_clause_sets
+from sat_loader import PBSATFormula, UnsatError
 from solvers import Optimiser, build_eval_verify, seq_eval_verify
 
 logger = logging.getLogger(__name__)
@@ -189,6 +190,7 @@ def run_solver(
     n_vars: int,
     n_clause: int,
     objs: tuple[Objective, ...],
+    xor_rref_meta: XorRREFMetadata | None = None,
     prefix_vectors: Array | None = None,
     *,
     var_mapper: VarMapper,
@@ -228,7 +230,7 @@ def run_solver(
 
     # Construct pure JAX functions (closures) and build solver.
     obj_eval_fns, obj_verify_fns = build_eval_verify(objs, optimiser == "unbounded")
-    seq_evaluator, seq_verifier = seq_eval_verify(obj_eval_fns, obj_verify_fns)
+    seq_evaluator, seq_verifier = seq_eval_verify(obj_eval_fns, obj_verify_fns, xor_rref_meta=xor_rref_meta)
     solver = Optimiser(seq_evaluator, seq_verifier, algorithm=optimiser, maxiter=maxiters, tol=solver_tol)
 
     seed = int(time()) if rand_seed else 0
@@ -255,6 +257,8 @@ def run_solver(
             logger.info("Cache size unknown, using 1% VRAM heuristic")
         dtype_sz = jnp.dtype(objs[0].ffts.dft.dtype).itemsize
         all_obj_sz = sum([np.prod([max(o.clauses.lits.shape), max(o.ffts.dft.shape) ** 2, dtype_sz]) for o in objs])
+        if xor_rref_meta is not None:
+            all_obj_sz += int(np.prod(np.asarray(xor_rref_meta.rref_free_part.shape)))
         guess_batch = int(np.floor(gpu_mem_target / (all_obj_sz))) * n_devices
         guess_batch -= guess_batch % n_devices
         guess_batch = max(guess_batch, n_devices)  # Ensure at least 1 per device
@@ -717,12 +721,24 @@ def main(problem_file: str, config: AFSATConfig) -> None:
         n_devices=config.runtime_common.n_devices,
         disk_cache=config.invocation.disk_cache,
         file=problem_file,
-        compactify=False
+        compactify=False,
+        xor_rref=config.runtime_afsat.xor_rref,
     )
     stamp2 = time()
     read_time = stamp2 - stamp1
 
+    maxsatish_mode = bool(config.runtime_common.counting or config.runtime_common.unsat_thresh)
     objectives = sat_parser.process_clauses_to_array()
+    xor_rref_meta: XorRREFMetadata | None = None
+    if config.runtime_afsat.xor_rref and sat_parser.xor_clause_sets:
+        xor_rref_meta = build_xor_rref_metadata_from_clause_sets(sat_parser.xor_clause_sets)
+        if xor_rref_meta is None:
+            if not maxsatish_mode:
+                print("s UNSATISFIABLE")
+                raise UnsatError("XOR subsystem is inconsistent under RREF preprocessing")
+
+            logger.warning("XOR RREF preprocessing unavailable; continuing without XOR projection")
+
     n_var = sat_parser.n_var
     n_clause = sat_parser.n_clause
     prefixes = sat_parser.process_prefix(config.invocation.prefix_file)
@@ -735,6 +751,7 @@ def main(problem_file: str, config: AFSATConfig) -> None:
         n_var,
         n_clause,
         objectives,
+        xor_rref_meta=xor_rref_meta,
         prefix_vectors=prefixes,
         var_mapper=sat_parser.var_mapper,
     )
@@ -794,6 +811,7 @@ if __name__ == "__main__":
     runtime_afsat_opts("-b", "--batch", type=int, field="batch_per_device", help="Batch size. -1 computes heuristic maximum")
     runtime_afsat_opts("-f", "--fuzz", type=int, field="fuzz", help="Number of times to attempt fuzzing per batch")
     runtime_afsat_opts("-w", "--warmup", action="store_true", field="warmup", help="Perform a warmup run before starting timer")
+    runtime_afsat_opts("--xor_rref", action="store_true", field="xor_rref", help="Group all XOR clauses and enable RREF projection")
 
     optimiser_opts = make_option_group("Optimiser Aliases", "optimiser")
     optimiser_opts("-i", "--iters_desc", type=int, field="max_iters", help="Solver maximum iterations")

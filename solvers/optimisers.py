@@ -31,6 +31,7 @@ from scipy.optimize import Bounds, OptimizeResult
 from scipy.optimize import minimize as ScipyMinimize
 
 from boolean_whf import Objective, clause_type_ids
+from xor_rref import XorRREFMetadata
 
 logger = logging.getLogger(__name__)
 
@@ -67,8 +68,37 @@ UNSAT_RULES: dict[str, UnsatRule] = {
 # fmt: on
 
 
-def _bind_unsat_rule(template: UnsatRule, mask: Array, cards: Array) -> VerifyFn:
+def _bind_unsat_rule(template: UnsatRule, mask: Array, cards: Array) -> Callable[[Array], Array]:
     return lambda x, _t=template, _m=mask, _c=cards: _t(x, _m, _c)
+
+
+def _make_xor_projector(meta: XorRREFMetadata) -> Callable[[Array], Array]:
+    free_part = meta.rref_free_part
+    b_final = meta.b_final
+    dep_idx = meta.dependent_indices
+    free_idx = meta.free_indices
+    n_free = int(meta.free_indices.shape[0])
+
+    def project(x: Array) -> Array:
+        x_free = x[free_idx]
+        dtype = x.dtype
+        free_part_t = free_part.astype(dtype)
+        b_final_t = b_final.astype(dtype)
+
+        binary_free = (x_free < 0).astype(dtype)
+        row_parity = jnp.mod(jnp.dot(free_part_t, binary_free) + b_final_t, 2.0)
+        dep_signs = 1.0 - 2.0 * row_parity
+
+        if n_free == 0:
+            dep_mags = jnp.ones_like(dep_signs)
+        else:
+            log_mags = jnp.log(jnp.clip(jnp.abs(x_free), 1e-7, 1.0))
+            dep_mags = jnp.exp(jnp.dot(free_part_t, log_mags))
+
+        x_dep = dep_signs * dep_mags
+        return x.at[dep_idx].set(x_dep)
+
+    return project
 
 
 def build_eval_verify(objs: tuple[Objective, ...], unbounded: bool) -> tuple[tuple[EvalFn, ...], tuple[VerifyFn, ...]]:
@@ -95,6 +125,7 @@ def build_eval_verify(objs: tuple[Objective, ...], unbounded: bool) -> tuple[tup
         mask = obj.clauses.mask
         cards = obj.clauses.cards
         types = obj.clauses.types
+        is_xor_obj = bool(np.all(np.asarray(types).reshape(-1) == clause_type_ids["xor"]))
 
         dft, idft = obj.ffts
         forward_mask = True if jnp.all(obj.forward_mask) else obj.forward_mask
@@ -148,7 +179,10 @@ def build_eval_verify(objs: tuple[Objective, ...], unbounded: bool) -> tuple[tup
                 unsat = unsat | jnp.where(type_mask, unsat_clauses, False)
             return unsat
 
-        eval_f = evaluate if ~jnp.all(types == clause_type_ids["xor"]) else evaluate_xor
+        if is_xor_obj:
+            eval_f = evaluate_xor
+        else:
+            eval_f = evaluate
         return eval_f, verify
 
     eval_fns: tuple[EvalFn]
@@ -157,15 +191,30 @@ def build_eval_verify(objs: tuple[Objective, ...], unbounded: bool) -> tuple[tup
     return eval_fns, verify_fns
 
 
-def seq_eval_verify(eval_fns: tuple[EvalFn, ...], verify_fns: tuple[VerifyFn, ...]) -> tuple[SeqEvalFn, VerifyFn]:
+def seq_eval_verify(
+    eval_fns: tuple[EvalFn, ...],
+    verify_fns: tuple[VerifyFn, ...],
+    xor_rref_meta: XorRREFMetadata | None = None,
+) -> tuple[SeqEvalFn, VerifyFn]:
     """
     Groups a collection (usually all) of Evaluation functions & Verifier functions into a sequence.
     """
 
+    xor_projector: Callable[[Array], Array] | None = _make_xor_projector(xor_rref_meta) if xor_rref_meta is not None else None
+
+    def _apply_fixed_and_projection(x: Array, fixed_vars: Array) -> Array:
+        x_eval = jnp.where(fixed_vars, jax.lax.stop_gradient(x), x)
+        if xor_projector is None:
+            return x_eval
+
+        x_proj = xor_projector(x_eval)
+        return jnp.where(fixed_vars, x_eval, x_proj)
+
     def seq_evals(x: Array, fixed_vars: Array, weights: tuple[Array, ...]) -> tuple[Array, Array | tuple[Array, Array]]:
-        costs = [evaluate(x, fixed_vars, weight) for (evaluate, weight) in zip(eval_fns, weights)]
+        x_eval = _apply_fixed_and_projection(x, fixed_vars)
+        costs = [evaluate(x_eval, fixed_vars, weight) for (evaluate, weight) in zip(eval_fns, weights)]
         cost = jnp.sum(jnp.array(costs))
-        return cost, (x, cost)  # returns costs in aux for breakdown by objective. aux info - remove when consolidating
+        return cost, (x_eval, cost)  # returns costs in aux for breakdown by objective. aux info - remove when consolidating
 
     def seq_verifies(x: Array) -> Array:
         all_res = [verify(x) for verify in verify_fns]
@@ -201,10 +250,11 @@ class Optimiser(abc.ABC):
 
                 def opt(x: Array, fixed_vars: Array, weights: tuple[Array, ...]) -> tuple[Array, Array, Array, Array]:
                     x_opt, state = lbfgs.run(init_params=x, fixed_vars=fixed_vars, weights=weights)
-                    final_cost, _ = evaluator(x_opt, fixed_vars, weights)
-                    final_aux: Any = (x_opt, final_cost)
-                    unsat = jnp.squeeze(verifier(x_opt))
-                    return x_opt, unsat, jnp.atleast_1d(state.iter_num), final_aux
+                    final_cost, eval_aux = evaluator(x_opt, fixed_vars, weights)
+                    x_eval = eval_aux[0]
+                    final_aux: Any = (x_eval, final_cost)
+                    unsat = jnp.squeeze(verifier(x_eval))
+                    return x_eval, unsat, jnp.atleast_1d(state.iter_num), final_aux
 
             if self.algo in ["unbounded"]:
                 gd = GradientDescent(fun=evaluator, maxiter=self.maxiter, has_aux=True)
@@ -212,10 +262,11 @@ class Optimiser(abc.ABC):
 
                 def opt(x: Array, fixed_vars: Array, weights: tuple[Array, ...]) -> tuple[Array, Array, Array, Array]:
                     x_opt, state = gd.run(init_params=x, fixed_vars=fixed_vars, weights=weights)
-                    final_cost, _ = evaluator(x_opt, fixed_vars, weights)
-                    final_aux: Any = (x_opt, final_cost)
-                    unsat = jnp.squeeze(verifier(x_opt))
-                    return x_opt, unsat, jnp.atleast_1d(state.iter_num), final_aux
+                    final_cost, eval_aux = evaluator(x_opt, fixed_vars, weights)
+                    x_eval = eval_aux[0]
+                    final_aux: Any = (x_eval, final_cost)
+                    unsat = jnp.squeeze(verifier(x_eval))
+                    return x_eval, unsat, jnp.atleast_1d(state.iter_num), final_aux
 
             if self.algo in ["lbfgsb"]:
                 lbfgsb = LBFGSB(fun=evaluator, maxiter=self.maxiter, has_aux=True)
@@ -224,10 +275,11 @@ class Optimiser(abc.ABC):
                 def opt(x: Array, fixed_vars: Array, weights: tuple[Array, ...]) -> tuple[Array, Array, Array, Array]:
                     bounds = (-1 * jnp.ones_like(x), jnp.ones_like(x))
                     x_opt, state = lbfgsb.run(init_params=x, fixed_vars=fixed_vars, weights=weights, bounds=bounds)
-                    final_cost, _ = evaluator(x_opt, fixed_vars, weights)
-                    final_aux: Any = (x_opt, final_cost)
-                    unsat = jnp.squeeze(verifier(x_opt))
-                    return x_opt, unsat, jnp.atleast_1d(state.iter_num), final_aux
+                    final_cost, eval_aux = evaluator(x_opt, fixed_vars, weights)
+                    x_eval = eval_aux[0]
+                    final_aux: Any = (x_eval, final_cost)
+                    unsat = jnp.squeeze(verifier(x_eval))
+                    return x_eval, unsat, jnp.atleast_1d(state.iter_num), final_aux
 
             elif self.algo in ["josp-lbfgsb"]:
                 spminB = ScipyBoundedMinimize(fun=evaluator, method="L-BFGS-B", maxiter=self.maxiter, has_aux=True)
@@ -236,10 +288,11 @@ class Optimiser(abc.ABC):
                 def opt(x: Array, fixed_vars: Array, weights: tuple[Array, ...]) -> tuple[Array, Array, Array, Array]:
                     bounds = (-1 * jnp.ones_like(x), jnp.ones_like(x))
                     x_opt, state = spminB.run(x, fixed_vars=fixed_vars, weights=weights, bounds=bounds)
-                    final_cost, _ = evaluator(x_opt, fixed_vars, weights)
-                    final_aux: Any = (x_opt, final_cost)
-                    unsat = jnp.squeeze(verifier(x_opt))
-                    return x_opt, unsat, jnp.atleast_1d(state.iter_num), final_aux
+                    final_cost, eval_aux = evaluator(x_opt, fixed_vars, weights)
+                    x_eval = eval_aux[0]
+                    final_aux: Any = (x_eval, final_cost)
+                    unsat = jnp.squeeze(verifier(x_eval))
+                    return x_eval, unsat, jnp.atleast_1d(state.iter_num), final_aux
 
             elif self.algo in ["pgd"]:
                 pgd = ProjectedGradient(fun=evaluator, projection=box, maxiter=self.maxiter, has_aux=True, tol=tol)
@@ -247,10 +300,11 @@ class Optimiser(abc.ABC):
 
                 def opt(x: Array, fixed_vars: Array, weights: tuple[Array, ...]) -> tuple[Array, Array, Array, Array]:
                     x_opt, state = pgd.run(x, fixed_vars=fixed_vars, weights=weights, hyperparams_proj=(-1, 1))
-                    final_cost, _ = evaluator(x_opt, fixed_vars, weights)
-                    final_aux: Any = (x_opt, final_cost)
-                    unsat = jnp.squeeze(verifier(x_opt))
-                    return x_opt, jnp.atleast_1d(unsat), jnp.atleast_1d(state.iter_num), final_aux
+                    final_cost, eval_aux = evaluator(x_opt, fixed_vars, weights)
+                    x_eval = eval_aux[0]
+                    final_aux: Any = (x_eval, final_cost)
+                    unsat = jnp.squeeze(verifier(x_eval))
+                    return x_eval, jnp.atleast_1d(unsat), jnp.atleast_1d(state.iter_num), final_aux
 
             else:
                 pass
@@ -283,7 +337,7 @@ class Optimiser(abc.ABC):
             logger.info("Setting up ScipyBounded L-BFGS-B (CPU) with JIT'd eval+verify (GPU)")
             _, _, eval_fun = job._make_funs_without_aux(fun=evaluator, value_and_grad=False, has_aux=True)
             v_eval_fun = jax.jit(jax.vmap(eval_fun, in_axes=(0, 0, None)))
-            v_verifier = jax.jit(jax.vmap(verifier, in_axes=(0)))
+            v_verifier = jax.jit(jax.vmap(verifier, in_axes=(0,)))
             self.eval_fun = v_eval_fun
 
             def full_vectorise(
@@ -300,9 +354,11 @@ class Optimiser(abc.ABC):
                 options = {"maxiter": self.maxiter}
                 res: OptimizeResult = ScipyMinimize(flat, x0, bounds=bounds, jac=True, options=options)
                 x_opt = jnp.array(res.x).reshape(x.shape)
-                unsat = jnp.squeeze(v_verifier(x_opt))
+                _, eval_aux = evaluator(x_opt, fixed_vars, weights)
+                x_eval = eval_aux[0]
+                unsat = jnp.squeeze(v_verifier(x_eval))
                 unsat_cl_count = jnp.sum(jnp.atleast_1d(unsat), axis=0)
-                return x_opt, unsat, jnp.array([res.nit]), unsat_cl_count, jnp.array(res.aux)
+                return x_eval, unsat, jnp.array([res.nit]), unsat_cl_count, jnp.array(res.aux)
 
             self.run = full_vectorise
 
