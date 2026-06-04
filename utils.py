@@ -52,7 +52,7 @@ class RuntimeCommonConfig:
     rand_seed: bool = False
     unsat_thresh: float = 0.0
     sample_method: str = "bias"
-    restart_interval: int = 0
+    restart_interval: int = 1
     weight_decay: float = 0.9
 
 
@@ -92,7 +92,7 @@ class OutputLoggingConfig:
 
     debug_level: str = "ERROR"
     stdout_log: bool = False
-    log_propagate: bool = False
+    log_propagate: bool = True
     binary_v: bool = False
     anomaly_quit: bool = False
 

@@ -488,6 +488,15 @@ def run_solver(
 
                 F_x = F_opt_x
 
+        opt_iters_local = np.array(opt_iters.flatten()).tolist()
+        batches_done += 1
+        end_batch = time()
+
+        all_unsats.extend(np.array(opt_unsat_ct.flatten()).tolist())
+        all_evals.extend(np.array(eval_scores.flatten()).tolist())
+        all_iters.extend(opt_iters_local)
+        all_flips.extend(np.array(flips.flatten()).tolist())
+
         if found_sol:
             first_sol = tuple(np.sign(best_x).astype(int).tolist())
             sol_locs: list[int] = jnp.argwhere(jnp.where(opt_unsat_ct < 1, 1, 0)).flatten().tolist()
@@ -509,21 +518,10 @@ def run_solver(
                         infobars[x].close()
                     pbar.close()
                     logger.info("SAT! at sample {}".format(max(batches_done, 0) * batch + batch_best_loc))
-                opt_iters_local = np.array(opt_iters.flatten()).tolist()
-                batches_done += 1
-                end_batch = time()
                 break
-
-        opt_iters_local = np.array(opt_iters.flatten()).tolist()
-        batches_done += 1
-        end_batch = time()
 
         if restart_thresh:
             restart_unsats.append(np.asarray(opt_unsat))
-            all_unsats.extend(np.array(opt_unsat_ct.flatten()).tolist())
-            all_evals.extend(np.array(eval_scores.flatten()).tolist())
-            all_iters.extend(opt_iters_local)
-            all_flips.extend(np.array(flips.flatten()).tolist())
             # TODO: There is probably some way to calculate how many restarts are needed given the batch size to get
             # enough of a sample to ensure the reweighting is meaningful. If there's 500 clauses and we are only running
             # batches of 100, we probably need restart_thresh to be more than 1, at the very least. I think? I don't
