@@ -831,7 +831,8 @@ if __name__ == "__main__":
     config.runtime_common.n_devices = config.runtime_common.n_devices or n_devices
 
     QUIT_ON_ANOMALY = config.output_logging.anomaly_quit
-    logger.propagate = config.output_logging.log_propagate
+    # Keep module logs routed through root handlers configured below.
+    logger.propagate = True
     logging.basicConfig(
         level=getattr(logging, config.output_logging.debug_level.upper()),
         # format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
