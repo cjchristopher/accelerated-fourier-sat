@@ -63,7 +63,7 @@ class RuntimeAFSATConfig:
     batch_per_device: int = -1
     fuzz: int = 0
     warmup: bool = False
-    xor_rref: bool = False
+    xor_rref: bool = True
 
 
 @dataclass
