@@ -225,39 +225,31 @@ Until venue metadata is finalized, cite the manuscript (or arXiv preprint, when 
 For software citation, cite the exact version used, preferring a release DOI, then a release tag, otherwise an exact commit hash.
 
 ```bibtex
-@unpublished{christopher26-afsat,
-  title={Accelerated Fourier SAT: Fully Realising a GPU-based Pseudo-Boolean SAT Solver},
-  author={Christopher, Cody and Gretton, Charles},
+@misc{christopher2026afsat,
+  title={Accelerated Fourier SAT (AFSAT): Fully Realising a GPU-based Symmetric Pseudo-Boolean SAT Solver}, 
+  author={Cody J Christopher and Charles Gretton},
   year={2026},
-  note={Submitted for peer review and publication}
-  % archivePrefix={arXiv},
-  % eprint={TBD},
-  % primaryClass={cs.AI},
-  % booktitle={Proceedings of the 29th International Conference on Theory and Applications of Satisfiability Testing (SAT 2026)},
-  % doi={TBD},
-  % pages={TBD},
-  % publisher={TBD}
+  eprint={2606.06641},
+  archivePrefix={arXiv},
+  primaryClass={cs.AI},
+  url={https://arxiv.org/abs/2606.06641}, 
 }
 
-@software{christopher26-afsat-git,
+@misc{christopher2026clsstudy,
+  title={A Study of Parallel Continuous Local Search}, 
+  author={Cody J Christopher and Charles Gretton},
+  year={2026},
+  eprint={2606.06656},
+  archivePrefix={arXiv},
+  primaryClass={cs.AI},
+  url={https://arxiv.org/abs/2606.06656}, 
+}
+
+@software{christopher26afsat-git,
   title={Accelerated Fourier SAT (AFSAT): Fast (GPU Accelerated) Fourier-SAT Solver},
   author={Christopher, Cody and Gretton, Charles},
   year={2026},
   url={https://github.com/cjchristopher/accelerated-fourier-sat}
-}
-
-@unpublished{christopher26-cls,
-  title={A Study of Parallel Continuous Local Search},
-  author={Christopher, Cody and Gretton, Charles},
-  year={2026},
-  note={Submitted for peer review and publication}
-  % archivePrefix={arXiv},
-  % eprint={TBD},
-  % primaryClass={cs.AI},
-  % booktitle={Proceedings of the 29th International Conference on Theory and Applications of Satisfiability Testing (SAT 2026)},
-  % doi={TBD},
-  % pages={TBD},
-  % publisher={TBD}
 }
 ```
 
