@@ -5,12 +5,12 @@ import jax
 import jax.numpy as jnp
 from jax import Array
 
-SUPPORTED_SAMPLE_METHODS: tuple[str, ...] = ("bias", "coin", "uniform", "trunc")
+SAMPLERS: tuple[str, ...] = ("bias", "coin", "uniform", "trunc")
 
 
 def _check_method(method: str) -> None:
-    if method not in SUPPORTED_SAMPLE_METHODS:
-        supported = ",".join(SUPPORTED_SAMPLE_METHODS)
+    if method not in SAMPLERS:
+        supported = ",".join(SAMPLERS)
         raise ValueError(f"Unsupported method: {method}. Supported methods: {supported}")
 
 

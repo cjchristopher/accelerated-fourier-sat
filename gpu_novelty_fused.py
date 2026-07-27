@@ -14,7 +14,8 @@ import logging
 import math
 import os
 import sys
-#from argparse import ArgumentParser as ArgParse
+
+# from argparse import ArgumentParser as ArgParse
 from argparse import SUPPRESS
 from time import perf_counter as time
 from typing import NamedTuple
@@ -23,7 +24,7 @@ from jsonargparse import ArgumentParser as ArgParse
 
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 os.environ["XLA_CLIENT_MEM_FRACTION"] = "0.95"
-os.environ["XLA_FLAGS"] = " ".join(
+os.environ["XLA_FLAGS"] = " ".join(  # noqa: FLY002
     [
         "--xla_enable_fast_math=true",
         "--xla_gpu_triton_gemm_any=true",
@@ -41,22 +42,22 @@ from collections.abc import Callable
 from typing import TypeAlias
 
 import jax
-from jax.experimental import io_callback
 import jax.numpy as jnp
 import numpy as np
 from jax import Array
+from jax.experimental import io_callback
 from jax.sharding import Mesh, NamedSharding
 from tqdm.auto import tqdm
+
+from boolean_whf import ClauseArrays, clause_type_ids
+from samplers import SAMPLERS, sample_assignments
+from sat_loader import PBSATFormula
 from utils import (
     LOG_LEVELS,
     NoveltyConfig,
     get_gpu_l2_cache_size,
 )
 from var_mapper import VarMapper
-from samplers import sample_assignments, SUPPORTED_SAMPLE_METHODS
-
-from boolean_whf import ClauseArrays, clause_type_ids
-from sat_loader import PBSATFormula
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +78,7 @@ VerifyFn: TypeAlias = Callable[[Array, Array], tuple[Array, Array]]
 DEFAULT_INNER_ITERS = 10
 
 
+# fmt: off
 class BeamState(NamedTuple):
     """State carried through beam search iterations."""
     points: Array           # (batch_size, n_vars) current beam
@@ -88,6 +90,7 @@ class BeamState(NamedTuple):
     rng_key: Array          # PRNG state
     done: Array             # () bool, early exit flag
     weights: Array          # (n_clauses,) clause weights
+# fmt: on
 
 
 def build_verifier(cls: tuple[ClauseArrays, ...]) -> VerifyFn:
@@ -186,7 +189,7 @@ def make_gpu_inner_loop(
     # Per-group constants for multi-prefix
     if multi_prefix:
         assert all_fixed_masks is not None and all_prefix_bools is not None
-        ppg = batch_size // n_prefix              # points per group
+        ppg = batch_size // n_prefix  # points per group
         n_cull_pg = n_cull // n_prefix
         n_keep_pg = ppg - n_cull_pg
 
@@ -264,9 +267,12 @@ def make_gpu_inner_loop(
                 group_fill_keys = jax.random.split(fill_key, n_prefix)
 
                 def expand_group(
-                    group_pts: Array, group_mask: Array, gkey: Array,
+                    group_pts: Array,
+                    group_mask: Array,
+                    gkey: Array,
                 ) -> tuple[Array, Array, Array]:
                     pkeys = jax.random.split(gkey, ppg)
+
                     def step(point: Array, key: Array) -> tuple[Array, Array, Array]:
                         candidates = point ^ group_mask  # (n_flip, n_vars)
                         w_scores, u_masks = verifier(candidates, weights)
@@ -279,11 +285,14 @@ def make_gpu_inner_loop(
                         else:
                             b = jnp.argmin(noisy)
                             return candidates[b], u_counts[b], u_masks[b]
+
                     nbrs, us, ms = jax.vmap(step)(group_pts, pkeys)
                     return nbrs.reshape(-1, n_vars), us.reshape(-1), ms.reshape(-1, n_clauses)
 
                 expanded_g, unsats_g, masks_g = jax.vmap(expand_group)(
-                    grouped, flip_mask, group_step_keys,
+                    grouped,
+                    flip_mask,
+                    group_step_keys,
                 )
                 # expanded_g: (n_prefix, ppg*top_m, n_vars)
                 # unsats_g:   (n_prefix, ppg*top_m)
@@ -307,8 +316,11 @@ def make_gpu_inner_loop(
 
                 # Per-group selection with prefix-aware refill
                 def select_group(
-                    g_exp: Array, g_masks: Array,
-                    g_fixed: Array, g_bools: Array, g_fkey: Array,
+                    g_exp: Array,
+                    g_masks: Array,
+                    g_fixed: Array,
+                    g_bools: Array,
+                    g_fkey: Array,
                 ) -> Array:
                     scores = jnp.sum(g_masks.astype(jnp.float32) * weights, axis=-1)
                     sorted_idx = jnp.argsort(scores)
@@ -321,8 +333,11 @@ def make_gpu_inner_loop(
                     return kept
 
                 selected_g = jax.vmap(select_group)(
-                    expanded_g, masks_g,
-                    all_fixed_masks, all_prefix_bools, group_fill_keys,
+                    expanded_g,
+                    masks_g,
+                    all_fixed_masks,
+                    all_prefix_bools,
+                    group_fill_keys,
                 )
                 new_points = selected_g.reshape(batch_size, n_vars)
 
@@ -403,13 +418,9 @@ def run_beam_search(
     batch_size = runtime_novelty.beam_per_device
     n_devices = runtime_common.n_devices
     max_iters = optimiser_cfg.max_iters
-    restart_thresh = runtime_common.restart_interval
-    sample_method = runtime_common.sample_method
-    unsat_h = (
-        int(runtime_common.unsat_thresh * n_clauses)
-        if runtime_common.unsat_thresh
-        else 0
-    )
+    restart_thresh = runtime_common.restart_f
+    sample_method = runtime_common.pt_sampler
+    unsat_h = int(runtime_common.unsat_thresh * n_clauses) if runtime_common.unsat_thresh else 0
     rand_seed = runtime_common.rand_seed
     counting = runtime_common.counting
     top_m = runtime_novelty.top_m
@@ -433,8 +444,8 @@ def run_beam_search(
 
     # ── Prefix handling ──────────────────────────────────────────────────
     n_prefix = prefixes.shape[0] if prefixes is not None else 0
-    single_prefix = (n_prefix == 1)
-    multi_prefix = (n_prefix > 1)
+    single_prefix = n_prefix == 1
+    multi_prefix = n_prefix > 1
     ttfs = 0
 
     if single_prefix:
@@ -443,8 +454,8 @@ def run_beam_search(
         free_indices = np.where(prefixes[0] == 0)[0]
         n_flip = len(free_indices)
         flip_mask = jnp.eye(n_vars, dtype=bool)[free_indices]  # (n_free, n_vars)
-        fixed_mask_1d = jnp.array(prefixes[0] != 0)             # (n_vars,) True where fixed
-        prefix_bools_1d = jnp.array(prefixes[0] < 0)            # (n_vars,) True where var=True
+        fixed_mask_1d = jnp.array(prefixes[0] != 0)  # (n_vars,) True where fixed
+        prefix_bools_1d = jnp.array(prefixes[0] < 0)  # (n_vars,) True where var=True
         logger.info(f"Single prefix: {n_flip} free vars (reduced from {n_vars})")
     elif multi_prefix:
         assert prefixes is not None
@@ -457,12 +468,14 @@ def run_beam_search(
         eye = np.eye(n_vars, dtype=bool)
         padded_masks = np.zeros((n_prefix, max_n_free, n_vars), dtype=bool)
         for k, fi in enumerate(all_free_indices):
-            padded_masks[k, :len(fi)] = eye[fi]
+            padded_masks[k, : len(fi)] = eye[fi]
         flip_mask = jnp.array(padded_masks)  # (n_prefix, max_n_free, n_vars)
-        all_fixed_masks = jnp.array(prefixes != 0)   # (n_prefix, n_vars)
-        all_prefix_bools = jnp.array(prefixes < 0)    # (n_prefix, n_vars)
+        all_fixed_masks = jnp.array(prefixes != 0)  # (n_prefix, n_vars)
+        all_prefix_bools = jnp.array(prefixes < 0)  # (n_prefix, n_vars)
         waste_pct = 100 * (1 - sum(n_free_per_prefix) / (n_prefix * max_n_free))
-        logger.info(f"Multi-prefix: {n_prefix} vectors, max_n_free={max_n_free}/{n_vars}, padding waste={waste_pct:.1f}%")
+        logger.info(
+            f"Multi-prefix: {n_prefix} vectors, max_n_free={max_n_free}/{n_vars}, padding waste={waste_pct:.1f}%"
+        )
     else:
         flip_mask = jnp.eye(n_vars, dtype=bool)
         n_flip = n_vars
@@ -483,7 +496,7 @@ def run_beam_search(
         l2_cache_size = get_gpu_l2_cache_size(devices[0])
         if l2_cache_size is not None:
             gpu_mem_target = int(l2_cache_size * 0.90) * n_devices * 2
-            logger.info(f"Targeting total cache: {l2_cache_size / (1024*1024):.1f} MB per GPU")
+            logger.info(f"Targeting total cache: {l2_cache_size / (1024 * 1024):.1f} MB per GPU")
         else:
             gpu_mem_target = devices[0].memory_stats()["bytes_limit"] * 0.01
             logger.info("Cache size unknown, using 1% VRAM heuristic")
@@ -492,7 +505,9 @@ def run_beam_search(
         all_obj_sz = sum([np.prod([*ca.lits.shape, dtype_sz]) for ca in cls])
         flip_sz = (n_clauses * n_flip + n_flip * n_vars) * jnp.dtype(bool).itemsize
         batch_size = int(np.floor((gpu_mem_target - all_obj_sz) / flip_sz)) * n_devices
-        logger.info(f"Batch size: {batch_size} (n_flip={n_flip}, consumed by clauses: {all_obj_sz / (1024*1024):.1f} MB)")
+        logger.info(
+            f"Batch size: {batch_size} (n_flip={n_flip}, consumed by clauses: {all_obj_sz / (1024 * 1024):.1f} MB)"
+        )
 
     # Batch alignment: must be divisible by n_devices and n_prefix (if any).
     alignment = math.lcm(max(n_prefix, 1), n_devices)
@@ -502,7 +517,9 @@ def run_beam_search(
     # Recompute n_cull/n_keep after final batch_size is settled.
     n_cull = int(batch_size * beta)
     n_keep = batch_size - n_cull
-    logger.info(f"Throwing away {n_cull} points after each batch of {batch_size} (before flip) points (keeping {n_keep})")
+    logger.info(
+        f"Throwing away {n_cull} points after each batch of {batch_size} (before flip) points (keeping {n_keep})"
+    )
 
     # Create GPU loop factory
     make_inner_loop, get_solutions, clear_solutions = make_gpu_inner_loop(
@@ -546,10 +563,12 @@ def run_beam_search(
             ppg_init = (batch_size * top_m) // n_prefix
             ppg_final = batch_size // n_prefix
             grouped = points.reshape(n_prefix, ppg_init, n_vars)
+
             def _init_select_group(group_pts: Array) -> Array:
                 scores, _ = verifier(group_pts, weights)
                 idx = jnp.argsort(scores)[:ppg_final]
                 return group_pts[idx]
+
             points = jax.vmap(_init_select_group)(grouped).reshape(batch_size, n_vars)
         else:
             weighted_scores, _ = verifier(points, weights)
@@ -593,7 +612,7 @@ def run_beam_search(
     # Compile inner loop once (weights are dynamic via BeamState)
     gpu_loop = make_inner_loop(inner_iters)
 
-    while (time() - t0 < timeout):
+    while time() - t0 < timeout:
         if max_iters > 0 and total_iters >= max_iters:
             break
 
@@ -822,12 +841,12 @@ if __name__ == "__main__":
     runtime_common_opts("-g", "--gpus", type=int, field="n_devices", help="Number of GPUs")
     runtime_common_opts("-c", "--counting", action="store_true", field="counting", help="Count solutions mode")
     runtime_common_opts("-s", "--seed", action="store_true", field="rand_seed", help="Random seed from time")
-    runtime_common_opts("--sample_meth", type=str, field="sample_method", choices=SUPPORTED_SAMPLE_METHODS, help="Sampling method for init/refill")
-    runtime_common_opts("-r", "--restart", type=int, field="restart_interval", help="Reweight interval (0=never)")
+    runtime_common_opts("-m", "--sampler", type=str, field="pt_sampler", choices=SAMPLERS, help="Initial point sampler")
+    runtime_common_opts("-r", "--restart_f", type=int, field="restart_f", help="Batches before reweighting (0 = never)")
     runtime_common_opts("-a", "--alpha", type=float, field="weight_decay", help="Weight decay (0.0-1.0)")
-    runtime_common_opts("-e", "--benchmark", action="store_true", field="benchmark", help="Benchmark mode (reduce output)")
+    runtime_common_opts("-e", "--benchmark", action="store_true", field="benchmark", help="Benchmarking (less output)")
     runtime_common_opts("--progress", action="store_false", field="benchmark", help="Display progress stats")
-    runtime_common_opts("-u", "--unsat_thresh", type=float, field="unsat_thresh", help="Stop when #UNSAT drops below threshold fraction")
+    runtime_common_opts("-u", "--unsat_thresh", type=float, field="unsat_thresh", help="MAXSAT - #UNSAT stop threshold")
 
     runtime_novelty_opts = make_option_group("Runtime Novelty Aliases", "runtime_novelty")
     runtime_novelty_opts("-b", "--beam", type=int, field="beam_per_device", help="Beam width (-1 for auto)")
@@ -840,8 +859,8 @@ if __name__ == "__main__":
     output_opts = make_option_group("Output Aliases", "output_logging")
     output_opts("-d", "--debug", choices=LOG_LEVELS, field="debug_level", help=f"Set logging level ({LOG_LEVELS})")
     output_opts("--binary_v", action="store_true", field="binary_v", help="Short form solution string")
-    output_opts("--stdout_log", action="store_true", field="stdout_log", help="Send log output to stdout instead of stderr")
-    
+    output_opts("--stdout_log", action="store_true", field="stdout_log", help="Logs output to stdout instead of stderr")
+
     args = parser.parse_args()
     instantiated = parser.instantiate(args)
     config = instantiated.config
@@ -859,5 +878,5 @@ if __name__ == "__main__":
 
     main(args.problem_file, config)
 
-    # flip in all direction * and * no flip. 
+    # flip in all direction * and * no flip.
     # keep some worst as well?

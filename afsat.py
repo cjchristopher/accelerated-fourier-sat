@@ -1,16 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0 OR GPL-2.0-or-later
-# ruff: disable[E402]
 from __future__ import annotations
 
 import functools
 import logging
 import math
 import os
-import sys
 import shutil
+import sys
+import threading
 from argparse import SUPPRESS
 from collections import Counter, defaultdict
+from collections.abc import Callable
 from contextlib import nullcontext
+from dataclasses import dataclass
 from time import perf_counter as time
 from typing import TypeAlias, overload
 
@@ -19,7 +21,7 @@ from jsonargparse import ArgumentParser as ArgParse
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"  # Disable pre-allocation
 os.environ["XLA_CLIENT_MEM_FRACTION"] = "0.95"  # Use full memory allocation
 # os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
-os.environ["XLA_FLAGS"] = " ".join(
+os.environ["XLA_FLAGS"] = " ".join(  # noqa: FLY002
     [
         "--xla_enable_fast_math=true",
         "--xla_gpu_triton_gemm_any=true",
@@ -44,6 +46,7 @@ os.environ.update(
 
 import jax
 import jax.numpy as jnp
+
 # TODO: Disable x64 when clauses are short enough - find this limit.
 jax.config.update("jax_platform_name", "gpu")  # gpu/cpu/tpu
 jax.config.update("jax_enable_x64", True)
@@ -55,7 +58,7 @@ jax.config.update("jax_compiler_enable_remat_pass", True)
 jax.config.update("jax_compilation_cache_dir", "/tmp/jax-cache")
 jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
 jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
-#jax.config.update("jax_persistent_cache_enable_xla_caches", "all")
+# jax.config.update("jax_persistent_cache_enable_xla_caches", "all")
 # # DEBUGGING BLOCK
 jax.config.update("jax_debug_nans", True)
 # jax.config.update("jax_debug_infs", True)
@@ -66,24 +69,24 @@ jax.config.update("jax_debug_nans", True)
 # jax.config.update("jax_explain_cache_misses", True)
 # jax.config.update("jax_check_tracer_leaks", True)
 
-#import jax_array_info as jai
+# import jax_array_info as jai
 import numpy as np
 from jax import Array
 from jax.sharding import Mesh, NamedSharding
 from sparklines import sparklines
 from tqdm.auto import tqdm
+
+from boolean_whf import Objective
+from samplers import SAMPLERS, sample_assignments
+from sat_loader import PBSATFormula, UnsatError
+from solvers import Optimiser, build_eval_verify, seq_eval_verify
 from utils import (
-    AFSATConfig,
     LOG_LEVELS,
+    AFSATConfig,
     get_gpu_l2_cache_size,
 )
 from var_mapper import VarMapper
-from samplers import sample_assignments, SUPPORTED_SAMPLE_METHODS
-
-from boolean_whf import Objective
 from xor_rref import XorRREFMetadata, build_xor_rref_metadata_from_clause_sets
-from sat_loader import PBSATFormula, UnsatError
-from solvers import Optimiser, build_eval_verify, seq_eval_verify
 
 logger = logging.getLogger(__name__)
 QUIT_ON_ANOMALY = False
@@ -98,7 +101,6 @@ QUIT_ON_ANOMALY = False
 # jaxlog.addHandler(fh)
 # jaxlog.propagate = False
 
-# ruff: enable[E402]
 
 if jax.__version_info__[1] < 7:
     jax.P = jax.sharding.PartitionSpec
@@ -185,6 +187,369 @@ def adjust_batch(devices: list, batch: int, target: int, est_mem_per_point: int,
     return opt_batch
 
 
+@dataclass
+class AFSATProblem:
+    problem_file: str
+    sat_parser: PBSATFormula
+    objectives: tuple[Objective, ...]
+    xor_rref_meta: XorRREFMetadata | None
+    n_var: int
+    n_clause: int
+    var_mapper: VarMapper
+
+
+@dataclass
+class AFSATWorkerSession:
+    prepared: AFSATProblem
+    solver: Optimiser
+    objs: tuple[Objective, ...]
+    weights: tuple[Array, ...]
+    batch_sharding: NamedSharding
+    batch: int
+    sample_method: str
+    counting: bool
+    fuzz_limit: int
+    unsat_h: int
+    optimiser: str
+    binary_v: bool
+    key: Array
+    f_key: Array
+    warmup_done: bool
+    warmup_found_solution: bool
+
+
+@dataclass
+class AFSATBatchResult:
+    best_unsat: int
+    sat: bool
+    threshold_hit: bool
+    best_assignment_signed: tuple[int, ...]
+    best_assignment_str: str
+    best_unsat_clause_indices: list[int]
+    iters: list[int]
+    unsat_per_point: list[int]
+    eval_per_point: list[float]
+    flips_per_point: list[int]
+    elapsed_sec: float
+
+
+def prepare_problem(
+    problem_file: str,
+    config: AFSATConfig,
+    *,
+    prefix_file: str | None = None,
+) -> tuple[AFSATProblem, Array | None, float, float]:
+    if not problem_file:
+        raise ValueError("No problem file specified")
+
+    stamp1 = time()
+    sat_parser = PBSATFormula(
+        workers=4,
+        n_devices=config.runtime_common.n_devices,
+        disk_cache=config.invocation.disk_cache,
+        file=problem_file,
+        compactify=False,
+        xor_rref=config.runtime_afsat.xor_rref,
+    )
+    stamp2 = time()
+    read_time = stamp2 - stamp1
+
+    maxsatish_mode = bool(config.runtime_common.counting or config.runtime_common.unsat_thresh)
+    objectives = sat_parser.process_clauses_to_array()
+    xor_rref_meta: XorRREFMetadata | None = None
+    if config.runtime_afsat.xor_rref and sat_parser.xor_clause_sets:
+        xor_rref_meta = build_xor_rref_metadata_from_clause_sets(sat_parser.xor_clause_sets)
+        if xor_rref_meta is None:
+            if not maxsatish_mode:
+                print("s UNSATISFIABLE")
+                raise UnsatError("XOR subsystem is inconsistent under RREF preprocessing")
+
+            logger.warning("XOR RREF preprocessing unavailable; continuing without XOR projection")
+
+    pf = config.invocation.prefix_file if prefix_file is None else prefix_file
+    prefixes = sat_parser.process_prefix(pf)
+    prefixes = jnp.array(prefixes) if prefixes is not None else None
+    stamp1 = time()
+    process_time = stamp1 - stamp2
+
+    prepared = AFSATProblem(
+        problem_file=problem_file,
+        sat_parser=sat_parser,
+        objectives=objectives,
+        xor_rref_meta=xor_rref_meta,
+        n_var=sat_parser.n_var,
+        n_clause=sat_parser.n_clause,
+        var_mapper=sat_parser.var_mapper,
+    )
+    return prepared, prefixes, read_time, process_time
+
+
+def create_worker_session(
+    prepared: AFSATProblem,
+    config: AFSATConfig,
+    *,
+    prefix_count: int = 1,
+    trace_hook: Callable[[str], None] | None = None,
+) -> AFSATWorkerSession:
+    def trace(message: str) -> None:
+        if trace_hook is None:
+            return
+        trace_hook(message)
+
+    trace("enter")
+    runtime_common = config.runtime_common
+    runtime_afsat = config.runtime_afsat
+    optimiser_cfg = config.optimiser
+    output_cfg = config.output_logging
+
+    n_vars = prepared.n_var
+    objs = prepared.objectives
+    xor_rref_meta = prepared.xor_rref_meta
+    n_devices = runtime_common.n_devices
+    trace(f"config n_devices={n_devices} prefix_count={prefix_count} warmup={int(runtime_afsat.warmup)}")
+    devices = jax.devices("gpu")[:n_devices]
+    trace(f"resolved devices={len(devices)}")
+    if not devices:
+        raise RuntimeError("No GPU devices were selected")
+
+    trace("building mesh")
+    _, obj_sharding, batch_sharding = get_mesh(devices)
+
+    trace("sharding objectives")
+    sharded_objs = shard_tree(objs, obj_sharding)
+    trace("allocating objective weights")
+    weights = tuple(jnp.full((obj.clauses.lits.shape[0],), 1.0, dtype=float) for obj in sharded_objs)
+    weights = shard_tree(weights, obj_sharding)
+
+    trace("building evaluators")
+    obj_eval_fns, obj_verify_fns = build_eval_verify(sharded_objs, optimiser_cfg.name == "unbounded")
+    trace("building sequential evaluator")
+    seq_evaluator, seq_verifier = seq_eval_verify(obj_eval_fns, obj_verify_fns, xor_rref_meta=xor_rref_meta)
+    trace("constructing optimiser")
+    solver = Optimiser(
+        seq_evaluator,
+        seq_verifier,
+        algorithm=optimiser_cfg.name,
+        maxiter=optimiser_cfg.max_iters,
+        tol=optimiser_cfg.tolerance,
+    )
+
+    seed = int(time()) if runtime_common.rand_seed else 0
+    logger.info(f"seed={seed}, rand_seed={runtime_common.rand_seed}")
+    trace(f"seed initialized={seed}")
+    key = jax.random.PRNGKey(np.array(seed))
+    f_key = jax.random.PRNGKey(np.array(seed + 1))
+
+    batch = runtime_afsat.batch_per_device
+    guess_batch = 0
+    if batch == -1:
+        trace("batch=-1 entering heuristic sizing")
+        logger.info("Guessing optimal batch size")
+        l2_cache_size = get_gpu_l2_cache_size(devices[0])
+        if l2_cache_size is not None:
+            gpu_mem_target = int(l2_cache_size * 0.95) * n_devices * 2
+            logger.info(f"Targeting total cache: {l2_cache_size / (1024 * 1024):.1f} MB per GPU")
+        else:
+            gpu_mem_target = devices[0].memory_stats()["bytes_limit"] * 0.01
+            logger.info("Cache size unknown, using 1% VRAM heuristic")
+        dtype_sz = jnp.dtype(sharded_objs[0].ffts.dft.dtype).itemsize
+        all_obj_sz = sum(
+            [np.prod([max(o.clauses.lits.shape), max(o.ffts.dft.shape) ** 2, dtype_sz]) for o in sharded_objs]
+        )
+        if xor_rref_meta is not None:
+            all_obj_sz += int(np.prod(np.asarray(xor_rref_meta.rref_free_part.shape)))
+        guess_batch = int(np.floor(gpu_mem_target / all_obj_sz)) * n_devices
+        guess_batch -= guess_batch % n_devices
+        guess_batch = max(guess_batch, n_devices)
+        trace(f"heuristic guess_batch={guess_batch}")
+
+        trace("materializing x_guess")
+        x_guess = jax.device_put(
+            jax.random.uniform(key, minval=0.99 - (5e-2), maxval=0.99, shape=(guess_batch, n_vars)),
+            batch_sharding,
+        )
+        empty_prefix = jax.device_put(
+            jnp.full((guess_batch, prefix_count), fill_value=False, dtype=bool), batch_sharding
+        )
+        w_guess = tuple((w - 1e-4) for w in weights)
+        trace("estimating peak memory")
+        peak_mem = solver.peak_memory_estimation(x_guess, empty_prefix, w_guess)
+        mem_est_per_point = peak_mem // guess_batch
+        trace(f"peak memory estimated per_point={mem_est_per_point}")
+    else:
+        mem_est_per_point = 1
+        gpu_mem_target = devices[0].memory_stats()["bytes_limit"]
+        trace(f"fixed batch mode batch={batch}")
+
+    trace("adjusting final batch")
+    batch = adjust_batch(devices, batch, gpu_mem_target, mem_est_per_point, prefix_count)
+    trace(f"adjusted batch={batch}")
+    warmup_found_solution = False
+
+    if runtime_afsat.warmup:
+        trace("warmup enabled")
+        if guess_batch != batch:
+            trace("rematerializing warmup arrays for adjusted batch")
+            x_guess = jax.device_put(
+                jax.random.uniform(f_key, minval=0.99 - (5e-2), maxval=0.99, shape=(batch, n_vars)),
+                batch_sharding,
+            )
+            empty_prefix = jax.device_put(jnp.full((batch, 1), fill_value=False, dtype=bool), batch_sharding)
+        trace("estimating warmup peak memory")
+        peak_mem = int(solver.peak_memory_estimation(x_guess, empty_prefix, weights))
+        target_bytes = max(int(gpu_mem_target), 1)
+        peak_frac = peak_mem / target_bytes
+        logger.info(
+            f"Warmup: shape - {x_guess.shape[0]}, peak memory - {peak_mem}, peak/point - {peak_mem // batch}, "
+            + f"target - {target_bytes}, frac-target - {peak_frac:.3f}"
+        )
+        trace("starting warmup")
+        warmup_stop = threading.Event()
+
+        def warmup_heartbeat() -> None:
+            elapsed = 0
+            while not warmup_stop.wait(15):
+                elapsed += 15
+                trace(f"warmup in progress elapsed={elapsed}s")
+
+        warmup_thread = threading.Thread(target=warmup_heartbeat, name="afsat-warmup-heartbeat", daemon=True)
+        warmup_thread.start()
+        warmup_start = time()
+        try:
+            solver.warmup((x_guess, empty_prefix, weights), bool(runtime_common.counting))
+        finally:
+            warmup_stop.set()
+            warmup_thread.join(timeout=1.0)
+        trace(f"warmup complete elapsed={time() - warmup_start:.3f}s")
+        warmup_found_solution = bool((not runtime_common.counting) and solver.warmup_sol)
+
+    trace("returning worker session")
+    return AFSATWorkerSession(
+        prepared=prepared,
+        solver=solver,
+        objs=sharded_objs,
+        weights=weights,
+        batch_sharding=batch_sharding,
+        batch=batch,
+        sample_method=runtime_common.pt_sampler,
+        counting=bool(runtime_common.counting),
+        fuzz_limit=runtime_afsat.fuzz,
+        unsat_h=int(runtime_common.unsat_thresh * 2 * n_vars) if runtime_common.unsat_thresh else 0,
+        optimiser=optimiser_cfg.name,
+        binary_v=output_cfg.binary_v,
+        key=key,
+        f_key=f_key,
+        warmup_done=runtime_afsat.warmup,
+        warmup_found_solution=warmup_found_solution,
+    )
+
+
+def run_worker_single_batch(session: AFSATWorkerSession, prefix_vectors: Array | None = None) -> AFSATBatchResult:
+    n_clause = session.prepared.n_clause
+    n_vars = session.prepared.n_var
+
+    start_batch = time()
+
+    session.key, s_key = jax.random.split(session.key)
+    session.f_key, s_f_key = jax.random.split(session.f_key)
+    x0, fixed_vars = sample_assignments(s_key, session.batch, n_vars, session.sample_method, prefix_vectors)
+    x0_dev = jax.device_put(x0.copy(), session.batch_sharding)
+    fixed_vars = jax.device_put(fixed_vars, session.batch_sharding)
+
+    opt_x0, opt_unsat, opt_iters, opt_unsat_ct, aux_info = session.solver.run(x0_dev, fixed_vars, session.weights)
+
+    if logger.isEnabledFor(logging.WARNING):
+        eval_last = np.abs(np.asarray(aux_info[-1]))
+        eval_oob = (eval_last > n_clause) & (~np.isclose(eval_last, float(n_clause)))
+        if np.any(eval_oob):
+            exceed = np.argwhere(eval_oob).flatten()
+            logger.warning(
+                f"[{session.optimiser}] Detected numerical instability! \n Abs(eval) > {n_clause} outside tolerance!\n"
+                + f"At indices {exceed} in the most recent batch, we found:\n"
+                + f"Energy/Eval values of: {np.asarray(aux_info[-1])[exceed]}\n"
+                + f"due to an input of: \n{np.asarray(opt_x0)[exceed, :]}"
+            )
+            if QUIT_ON_ANOMALY:
+                raise FloatingPointError("Numerical instability encountered and anomaly_quit is enabled")
+
+    flips = (opt_x0 > 0).sum(axis=1) - (x0 > 0).sum(axis=1)
+    _, eval_scores = aux_info
+    eval_scores = jnp.array(eval_scores).squeeze().T
+
+    batch_best_loc = jnp.argmin(opt_unsat_ct)
+    batch_best_unsat = jnp.take(opt_unsat_ct, batch_best_loc)
+    batch_best_x = opt_x0[batch_best_loc]
+    batch_best_unsat_clauses_idx = jnp.nonzero(opt_unsat[batch_best_loc])
+
+    best_x = np.asarray(batch_best_x).copy()
+    best_unsat = np.asarray(batch_best_unsat).copy()
+    best_unsat_clauses_idx = np.asarray(batch_best_unsat_clauses_idx).copy()
+
+    threshold_hit = bool(session.unsat_h and batch_best_unsat <= session.unsat_h)
+    found_sol = threshold_hit or bool(batch_best_unsat == 0)
+
+    if session.fuzz_limit and (session.counting or not found_sol):
+        fuzz_attempt = 0
+        F_x = opt_x0[:]
+        session.f_key, s_f_key = jax.random.split(session.f_key)
+        fuzz = jax.random.uniform(s_f_key, minval=1e-7, maxval=1e-2, shape=x0.shape)
+        fuzz_mag = 1
+        while fuzz_attempt < session.fuzz_limit:
+            fuzz_mask = np.ones(F_x.shape, dtype=bool)
+            if found_sol:
+                sol_locs = jnp.argwhere(jnp.where(opt_unsat_ct < 1, 1, 0)).flatten().tolist()
+                fuzz_mask[sol_locs, :] = False
+
+            fuzz_attempt += 1
+            if fuzz_mag != 1:
+                fuzz_adj = jnp.sign(fuzz) * jnp.abs(fuzz) ** (1 / fuzz_mag)
+            else:
+                fuzz_adj = fuzz
+
+            F_x = jnp.clip(jnp.where(fuzz_mask, F_x + fuzz_adj, F_x), -1, 1)
+
+            F_opt_x, F_opt_unsat, F_opt_iters, F_opt_unsat_ct, _ = session.solver.run(F_x, fixed_vars, session.weights)
+
+            F_batch_best_loc = jnp.argmin(F_opt_unsat_ct)
+            F_batch_best_unsat = jnp.take(F_opt_unsat_ct, F_batch_best_loc)
+            F_batch_best_x = opt_x0[F_batch_best_loc]
+            F_batch_best_unsat_clauses_idx = jnp.nonzero(opt_unsat[F_batch_best_loc])
+            if F_batch_best_unsat < best_unsat:
+                best_x = np.asarray(F_batch_best_x).copy()
+                best_unsat = np.asarray(F_batch_best_unsat).copy()
+                best_unsat_clauses_idx = np.asarray(F_batch_best_unsat_clauses_idx).copy()
+                opt_x0, opt_unsat, opt_iters, opt_unsat_ct = F_x, F_opt_unsat, F_opt_iters, F_opt_unsat_ct
+
+            if F_batch_best_unsat == 0:
+                found_sol = True
+                if not session.counting:
+                    break
+
+            if (jnp.sign(F_x) == jnp.sign(F_opt_x)).all():
+                fuzz_mag += 1
+            else:
+                fuzz_mag = 1
+
+            F_x = F_opt_x
+
+    signed_best = tuple(np.sign(best_x).astype(int).tolist())
+    best_str = session.prepared.var_mapper.assn_str(signed_best, session.binary_v, inc_zero=True)
+
+    return AFSATBatchResult(
+        best_unsat=int(np.asarray(best_unsat).item()),
+        sat=bool(np.asarray(best_unsat).item() == 0),
+        threshold_hit=threshold_hit,
+        best_assignment_signed=signed_best,
+        best_assignment_str=best_str,
+        best_unsat_clause_indices=[int(x) for x in best_unsat_clauses_idx.flatten().tolist()],
+        iters=np.array(opt_iters.flatten()).astype(int).tolist(),
+        unsat_per_point=np.array(opt_unsat_ct.flatten()).astype(int).tolist(),
+        eval_per_point=np.array(eval_scores.flatten()).astype(float).tolist(),
+        flips_per_point=np.array(flips.flatten()).astype(int).tolist(),
+        elapsed_sec=time() - start_batch,
+    )
+
+
 def run_solver(
     config: AFSATConfig,
     n_vars: int,
@@ -202,10 +567,10 @@ def run_solver(
 
     timeout = runtime_common.timeout_sec
     batch = runtime_afsat.batch_per_device
-    restart_thresh = runtime_common.restart_interval
+    restart_thresh = runtime_common.restart_f
     fuzz_limit = runtime_afsat.fuzz
     n_devices = runtime_common.n_devices
-    sample_method = runtime_common.sample_method
+    sample_method = runtime_common.pt_sampler
     optimiser = optimiser_cfg.name
     warmup = runtime_afsat.warmup
     benchmark = runtime_common.benchmark
@@ -248,7 +613,7 @@ def run_solver(
         if l2_cache_size is not None:
             # Target ~95% of detected cache budget to leave room for other data
             gpu_mem_target = int(l2_cache_size * 0.95) * n_devices * 2
-            logger.info(f"Targeting total cache: {l2_cache_size / (1024*1024):.1f} MB per GPU")
+            logger.info(f"Targeting total cache: {l2_cache_size / (1024 * 1024):.1f} MB per GPU")
 
         else:
             ### Dead branch for now - the above call builds in a sensible default.
@@ -296,7 +661,12 @@ def run_solver(
 
         peak_mem = solver.peak_memory_estimation(x_guess, empty_prefix, weights)
         mem_est_per_point = peak_mem // batch
-        logger.info(f"Warmup: shape - {x_guess.shape[0]}, peak memory - {peak_mem}, peak/point - {mem_est_per_point}")
+        target_bytes = max(int(gpu_mem_target), 1)
+        peak_frac = float(peak_mem) / target_bytes
+        logger.info(
+            f"Warmup: shape - {x_guess.shape[0]}, peak memory - {peak_mem}, peak/point - {mem_est_per_point}, "
+            + f"target - {target_bytes}, frac-target - {peak_frac:.3f}"
+        )
 
         warm_start = time()
         solver.warmup((x_guess, empty_prefix, weights), bool(counting))
@@ -364,7 +734,7 @@ def run_solver(
         # if logger.isEnabledFor(logging.WARNING) and batches_done < 5:
         #     print(f"c Final Assigment (batch {batches_done}, point 0)", np.asarray(opt_x0[0,:].copy().tolist()))
         #     print("c DIFFERENT?", not all((x0[0,:] == opt_x0[0,:]).tolist()))
-            # print(aux_info)
+        # print(aux_info)
 
         # Flag and bail if we encounter anomalous behaviour
         if logger.isEnabledFor(logging.WARNING):
@@ -382,15 +752,19 @@ def run_solver(
                 x_opt_oob = (x_opt_abs > 1.0) & (~np.isclose(x_opt_abs, 1.0))
                 if np.any(x_opt_oob):
                     escaped = np.argwhere(x_opt_oob)
-                    logger.warning(f"[{optimiser}] Optimizer returned out-of-bounds points at: {escaped}\n"
-                                   + f"Points: {opt_x0[escaped]}")
+                    logger.warning(
+                        f"[{optimiser}] Optimizer returned out-of-bounds points at: {escaped}\n"
+                        + f"Points: {opt_x0[escaped]}"
+                    )
 
                 aux_x_abs = np.abs(np.asarray(aux_info[0]))
                 aux_x_oob = (aux_x_abs > 1.0) & (~np.isclose(aux_x_abs, 1.0))
                 if np.any(aux_x_oob):
                     escaped_aux = np.argwhere(aux_x_oob)
-                    logger.warning(f"[{optimiser}] Auxiliary evaluation points left bounds at: {escaped_aux}\n"
-                                   + f"Points: {aux_info[0][escaped_aux]}")
+                    logger.warning(
+                        f"[{optimiser}] Auxiliary evaluation points left bounds at: {escaped_aux}\n"
+                        + f"Points: {aux_info[0][escaped_aux]}"
+                    )
                 if QUIT_ON_ANOMALY:
                     return 0.0
 
@@ -508,16 +882,16 @@ def run_solver(
             else:
                 all_sols[tuple(np.sign(opt_x0[batch_best_loc, :]).astype(int).tolist())] += 1
                 if not benchmark:
-                    # Close tqdm. 
-                    #TODO: We probably don't need this at all if we change tqdm usage (progress) to context manager.
-                    #TODO: we should change benchmark to track "progress instead" as the following is much clearer:
+                    # Close tqdm.
+                    # TODO: We probably don't need this at all if we change tqdm usage (progress) to context manager.
+                    # TODO: we should change benchmark to track "progress instead" as the following is much clearer:
                     # # if progress and not counting:
                     for x in range(len(histbars)):
                         histbars[x].close()
                     for x in range(len(infobars)):
                         infobars[x].close()
                     pbar.close()
-                    logger.info("SAT! at sample {}".format(max(batches_done, 0) * batch + batch_best_loc))
+                    logger.info(f"SAT! at sample {max(batches_done, 0) * batch + batch_best_loc}")
                 break
 
         if restart_thresh:
@@ -539,7 +913,7 @@ def run_solver(
                 # Gather unsat counts by clause
                 penalty = jnp.atleast_1d(jnp.concatenate(restart_unsats, axis=1).sum(axis=0))
                 if jnp.any(penalty):
-                    worst = penalty.max() 
+                    worst = penalty.max()
 
                     logger.debug(f"# Restart: {restart_ct} | Best MAX-SAT cost (#unsat): {best_unsat}")
                     logger.debug(f"Unsat counts: {penalty}, \nBest: {best_unsat_clauses_idx}")
@@ -622,9 +996,9 @@ def run_solver(
         pbar.close()
 
     sol_info = f"Accelerated Fourier SAT ({optimiser})"
-    print(f"c {"-"*len(sol_info)}")
+    print(f"c {'-' * len(sol_info)}")
     print(f"c {sol_info}")
-    print(f"c {"-"*len(sol_info)}")
+    print(f"c {'-' * len(sol_info)}")
 
     if len(all_sols):
         print("s SATISFIABLE")
@@ -632,9 +1006,9 @@ def run_solver(
             if not counting and first_sol != sol:
                 continue
             sol_str = var_mapper.assn_str(sol, binary_v)
-            #var_mapper.bin_str(sol) if binary_v else var_mapper.lits_str(sol)
+            # var_mapper.bin_str(sol) if binary_v else var_mapper.lits_str(sol)
             if counting:
-                logger.info(f"{sol_i+1}: v {sol_str} 0")
+                logger.info(f"{sol_i + 1}: v {sol_str} 0")
                 if not sol_i:
                     print("c ENUMERATING - example solution (of possibly many):")
                     print(f"v {sol_str} 0")
@@ -644,7 +1018,7 @@ def run_solver(
     else:
         signed_best = tuple(np.sign(best_x).astype(int).tolist())
         assign_str = var_mapper.assn_str(signed_best, binary_v, inc_zero=True)
-        #var_mapper.bin_str(signed_best) if binary_v else var_mapper.lits_str(signed_best, include_unknown=True)
+        # var_mapper.bin_str(signed_best) if binary_v else var_mapper.lits_str(signed_best, include_unknown=True)
 
         print("s UNKNOWN")
         print("c Best found MAX-SAT assignment (zero energy variables omitted or -):")
@@ -673,8 +1047,10 @@ def run_solver(
                     else:
                         find_idx -= obj_len
             for i, w in enumerate(weights):
-                logger.debug(f"\t{set((np.array(objs[i].clauses.types)).flatten().tolist())},{objs[i].clauses.lits.shape} \n{w}")
-    print(f"c {"-"*len(sol_info)}")
+                logger.debug(
+                    f"\t{set((np.array(objs[i].clauses.types)).flatten().tolist())},{objs[i].clauses.lits.shape} \n{w}"
+                )
+    print(f"c {'-' * len(sol_info)}")
 
     if logger.isEnabledFor(logging.INFO):
         if ttfs:
@@ -710,48 +1086,16 @@ def run_solver(
 
 
 def main(problem_file: str, config: AFSATConfig) -> None:
-    if not problem_file:
-        raise ValueError("No problem file specified")
-
-    stamp1 = time()
-    sat_parser = PBSATFormula(
-        workers=4,
-        n_devices=config.runtime_common.n_devices,
-        disk_cache=config.invocation.disk_cache,
-        file=problem_file,
-        compactify=False,
-        xor_rref=config.runtime_afsat.xor_rref,
-    )
-    stamp2 = time()
-    read_time = stamp2 - stamp1
-
-    maxsatish_mode = bool(config.runtime_common.counting or config.runtime_common.unsat_thresh)
-    objectives = sat_parser.process_clauses_to_array()
-    xor_rref_meta: XorRREFMetadata | None = None
-    if config.runtime_afsat.xor_rref and sat_parser.xor_clause_sets:
-        xor_rref_meta = build_xor_rref_metadata_from_clause_sets(sat_parser.xor_clause_sets)
-        if xor_rref_meta is None:
-            if not maxsatish_mode:
-                print("s UNSATISFIABLE")
-                raise UnsatError("XOR subsystem is inconsistent under RREF preprocessing")
-
-            logger.warning("XOR RREF preprocessing unavailable; continuing without XOR projection")
-
-    n_var = sat_parser.n_var
-    n_clause = sat_parser.n_clause
-    prefixes = sat_parser.process_prefix(config.invocation.prefix_file)
-    prefixes = jnp.array(prefixes) if prefixes is not None else None
-    stamp1 = time()
-    process_time = stamp1 - stamp2
+    prepared, prefixes, read_time, process_time = prepare_problem(problem_file, config)
 
     t_solve = run_solver(
         config,
-        n_var,
-        n_clause,
-        objectives,
-        xor_rref_meta=xor_rref_meta,
+        prepared.n_var,
+        prepared.n_clause,
+        prepared.objectives,
+        xor_rref_meta=prepared.xor_rref_meta,
         prefix_vectors=prefixes,
-        var_mapper=sat_parser.var_mapper,
+        var_mapper=prepared.var_mapper,
     )
 
     logger.info(f"Time reading input: {read_time}")
@@ -792,33 +1136,33 @@ if __name__ == "__main__":
     io_opts = make_option_group("IO Aliases", "invocation")
     io_opts("-y", "--profile", action="store_true", field="profile_enabled", help="Enable profiling")
     io_opts("--cache", type=str, field="disk_cache", help="Disk cache for FFT matrices")
-    io_opts("-p", "--prefix", type=str, field="prefix_file", help="Fixed assignments file, each a line of assigned vars")
+    io_opts("-p", "--prefix", type=str, field="prefix_file", help="Fixed assignments file, each a line of assignments")
 
     runtime_common_opts = make_option_group("Runtime Common Aliases", "runtime_common")
     runtime_common_opts("-t", "--timeout", type=int, field="timeout_sec", help="Maximum runtime (timeout seconds)")
-    runtime_common_opts("-r", "--restart_thresh", type=int, field="restart_interval", help="Batches before reweighting (never if 0)")
+    runtime_common_opts("-r", "--restart_f", type=int, field="restart_f", help="Batches before reweighting (0 = never)")
     runtime_common_opts("-n", "--n_devices", type=int, field="n_devices", help="Devices (eg. GPUs) to use. 0 uses all")
-    runtime_common_opts("-e", "--benchmark", action="store_true", field="benchmark", help="Benchmark mode (reduce output)")
-    runtime_common_opts("--progress", action="store_false", field="benchmark", help="Display progress stats (equiv to -e False)")
-    runtime_common_opts("-c", "--counting", action="store_true", field="counting", help="Counting mode. Count solns until timeout")
+    runtime_common_opts("-e", "--benchmark", action="store_true", field="benchmark", help="Benchmarking (less output)")
+    runtime_common_opts("--progress", action="store_false", field="benchmark", help="Display progress (impl. -e False)")
+    runtime_common_opts("-c", "--counting", action="store_true", field="counting", help="#SAT - Enum sols to timeout")
     runtime_common_opts("-s", "--rand_seed", action="store_true", field="rand_seed", help="Randomise seed")
-    runtime_common_opts("-u", "--unsat_thresh", type=float, field="unsat_thresh", help="Stop when #UNSAT drops below threshold (PLE)")
-    runtime_common_opts("-m", "--sample_meth", type=str, field="sample_method", choices=SUPPORTED_SAMPLE_METHODS, help="Starting point sampler")
+    runtime_common_opts("-u", "--unsat_thresh", type=float, field="unsat_thresh", help="MAXSAT - #UNSAT stop threshold")
+    runtime_common_opts("-m", "--sampler", type=str, field="pt_sampler", choices=SAMPLERS, help="Initial point sampler")
 
     runtime_afsat_opts = make_option_group("Runtime AFSAT Aliases", "runtime_afsat")
-    runtime_afsat_opts("-b", "--batch", type=int, field="batch_per_device", help="Batch size. -1 computes heuristic maximum")
+    runtime_afsat_opts("-b", "--batch", type=int, field="batch_per_device", help="Batch size. -1 = heuristic maximum")
     runtime_afsat_opts("-f", "--fuzz", type=int, field="fuzz", help="Number of times to attempt fuzzing per batch")
-    runtime_afsat_opts("-w", "--warmup", action="store_true", field="warmup", help="Perform a warmup run before starting timer")
-    runtime_afsat_opts("--xor_rref", action="store_true", field="xor_rref", help="Group all XOR clauses and enable RREF projection")
+    runtime_afsat_opts("-w", "--warmup", action="store_true", field="warmup", help="Warmup (dummy run) kernel")
+    runtime_afsat_opts("--xor_rref", action="store_true", field="xor_rref", help="Enable XOR GJ Elim (RREF projection)")
 
     optimiser_opts = make_option_group("Optimiser Aliases", "optimiser")
     optimiser_opts("-i", "--iters_desc", type=int, field="max_iters", help="Solver maximum iterations")
-    optimiser_opts("-q", "--solver_tol", type=float, field="tolerance", help="Optimiser convergence tolerance (if supported)")
-    optimiser_opts("-o", "--optimiser", "--optimizer", type=str, field="name", help="Optimiser")
+    optimiser_opts("-q", "--solver_tol", type=float, field="tolerance", help="Optimiser convergence tolerance")
+    optimiser_opts("-o", "--optimiser", "--optimizer", type=str, field="name", help="Optimiser algorithm")
 
     output_opts = make_option_group("Output Aliases", "output_logging")
     output_opts("-d", "--debug", choices=LOG_LEVELS, field="debug_level", help=f"Set logging level ({LOG_LEVELS})")
-    output_opts("--stdout_log", action="store_true", field="stdout_log", help="Send log output to stdout instead of stderr")
+    output_opts("--stdout_log", action="store_true", field="stdout_log", help="Logs output to stdout instead of stderr")
     output_opts("--anomaly_quit", action="store_true", field="anomaly_quit")
     output_opts("--log_propagate", action="store_true", field="log_propagate")
     output_opts("--binary_v", action="store_true", field="binary_v", help="Short form solution string")

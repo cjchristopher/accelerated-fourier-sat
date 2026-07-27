@@ -7,7 +7,6 @@ from typing import Any, TypeAlias
 
 import numpy as np
 
-
 logger = logging.getLogger(__name__)
 
 Assignment: TypeAlias = tuple[int, ...] | tuple[bool, ...]
@@ -19,7 +18,7 @@ class VarMapper:
     def __init__(self):
         self.dense_to_input_var: list[int] = []
         self.input_to_dense_var: dict[int, int] = {}
-        self.used_input_vars: tuple[int, ...] = tuple()
+        self.used_input_vars: tuple[int, ...] = ()
         self.max_input_var: int = 0
         self.sparse_vars: bool = False
 
@@ -28,8 +27,6 @@ class VarMapper:
         self.used_input_vars = tuple(sorted_vars)
         self.max_input_var = sorted_vars[-1] if sorted_vars else 0
         self.sparse_vars = self.max_input_var > len(sorted_vars) if sorted_vars else False
-        self.input_to_dense_var = {var: idx for idx, var in enumerate(sorted_vars, start=1)}
-        self.dense_to_input_var = [0] + sorted_vars
 
         if self.sparse_vars:
             logger.warning(
@@ -40,6 +37,8 @@ class VarMapper:
                 self.max_input_var,
                 len(self.used_input_vars),
             )
+            self.input_to_dense_var = {var: idx for idx, var in enumerate(sorted_vars, start=1)}
+            self.dense_to_input_var = [0] + sorted_vars
 
     def input_to_dense(self, lit: int, strict: bool = True) -> int | None:
         dense_var = self.input_to_dense_var.get(abs(lit))
@@ -102,7 +101,9 @@ class VarMapper:
             return literals
         return self.remap_literal_set(literals, strict=True)
 
-    def assn_str(self, assignment: Assignment, binary: bool = False, inc_zero: bool = False, bit_zero: str = "1") -> str:
+    def assn_str(
+        self, assignment: Assignment, binary: bool = False, inc_zero: bool = False, bit_zero: str = "1"
+    ) -> str:
         """Format an assignment tuple in canonical signed form for output.
 
         Canonical form uses {-1, 0, 1} where:
@@ -132,8 +133,7 @@ class VarMapper:
         max_input_var = 0
         for dense_var in range(1, len(assignment) + 1):
             mapped = self.map_to_input(dense_var)
-            if mapped > max_input_var:
-                max_input_var = mapped
+            max_input_var = max(max_input_var, mapped)
 
         if max_input_var <= 0:
             return ""

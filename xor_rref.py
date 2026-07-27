@@ -2,13 +2,14 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterable
 from typing import NamedTuple
 
 import jax.numpy as jnp
 import numpy as np
 from jax import Array
 from numpy.typing import NDArray
+
+from sat_loader import Clauses
 
 try:
     import galois
@@ -121,16 +122,12 @@ def _build_xor_rref_metadata_from_matrix(
     )
 
 
-def build_xor_rref_metadata_from_clause_sets(xor_clause_sets: Iterable[list[list[int]]]) -> XorRREFMetadata | None:
-    clause_sets = list(xor_clause_sets)
-    if not clause_sets:
-        return None
-
+def build_xor_rref_metadata_from_clause_sets(xor_clause_sets: list[Clauses]) -> XorRREFMetadata | None:
     xor_vars_set: set[int] = set()
-    n_rows = 0
-    for clause_set in clause_sets:
+    n_rows = 0  # sum([len(clause_set) for clause_set in xor_clause_sets])
+    for clause_set in xor_clause_sets:
+        n_rows += len(clause_set)
         for clause in clause_set:
-            n_rows += 1
             for lit in clause:
                 xor_vars_set.add(abs(lit) - 1)
 
@@ -144,7 +141,7 @@ def build_xor_rref_metadata_from_clause_sets(xor_clause_sets: Iterable[list[list
     parity = np.zeros(n_rows, dtype=np.uint8)
 
     row = 0
-    for clause_set in clause_sets:
+    for clause_set in xor_clause_sets:
         for clause in clause_set:
             base_parity = 1
             for lit in clause:
@@ -156,9 +153,3 @@ def build_xor_rref_metadata_from_clause_sets(xor_clause_sets: Iterable[list[list
             row += 1
 
     return _build_xor_rref_metadata_from_matrix(matrix, parity, xor_vars, n_rows)
-
-
-def build_xor_rref_metadata_from_clauses(xor_clauses: list[list[int]]) -> XorRREFMetadata | None:
-    return build_xor_rref_metadata_from_clause_sets([xor_clauses])
-
-

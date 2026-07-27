@@ -15,9 +15,9 @@ import numpy as np
 # import optimistix as optx
 from jax import Array
 from jaxopt import (
-    GradientDescent,
     LBFGS,
     LBFGSB,
+    GradientDescent,
     NonlinearCG,
     ProjectedGradient,
     ProximalGradient,
@@ -26,7 +26,6 @@ from jaxopt import (
 from jaxopt._src import base as job
 from jaxopt.projection import projection_box as box
 from numpy.typing import NDArray
-
 from scipy.optimize import Bounds, OptimizeResult
 from scipy.optimize import minimize as ScipyMinimize
 
@@ -200,7 +199,9 @@ def seq_eval_verify(
     Groups a collection (usually all) of Evaluation functions & Verifier functions into a sequence.
     """
 
-    xor_projector: Callable[[Array], Array] | None = _make_xor_projector(xor_rref_meta) if xor_rref_meta is not None else None
+    xor_projector: Callable[[Array], Array] | None = (
+        _make_xor_projector(xor_rref_meta) if xor_rref_meta is not None else None
+    )
 
     def _apply_fixed_and_projection(x: Array, fixed_vars: Array) -> Array:
         x_eval = jnp.where(fixed_vars, jax.lax.stop_gradient(x), x)
@@ -214,7 +215,8 @@ def seq_eval_verify(
         x_eval = _apply_fixed_and_projection(x, fixed_vars)
         costs = [evaluate(x_eval, fixed_vars, weight) for (evaluate, weight) in zip(eval_fns, weights)]
         cost = jnp.sum(jnp.array(costs))
-        return cost, (x_eval, cost)  # returns costs in aux for breakdown by objective. aux info - remove when consolidating
+        return cost, (x_eval, cost)  
+        # returns costs in aux for breakdown by objective. aux info - remove when consolidating
 
     def seq_verifies(x: Array) -> Array:
         all_res = [verify(x) for verify in verify_fns]
@@ -226,12 +228,7 @@ def seq_eval_verify(
 
 class Optimiser(abc.ABC):
     def __init__(
-        self,
-        evaluator: SeqEvalFn,
-        verifier: VerifyFn,
-        algorithm: str = "lbfgsb",
-        maxiter: int = 100,
-        tol: float = 1e-3
+        self, evaluator: SeqEvalFn, verifier: VerifyFn, algorithm: str = "lbfgsb", maxiter: int = 100, tol: float = 1e-3
     ) -> None:
         self.algo = algorithm
         self.maxiter = maxiter
@@ -393,16 +390,16 @@ class Optimiser(abc.ABC):
                 loc = jnp.argmin(batch_unsat_scores)
                 best_x = opt_x0[loc]
                 if batch_best == 0:
-                    print("Found a solution in warmup! SAT at index {}".format(loc))
+                    print(f"Found a solution in warmup! SAT at index {loc}")
                     out_string = "v"
                     assignment = []
                     for i in range(x0.shape[-1]):
                         lit = i + 1
                         if best_x[i] > 0:
-                            out_string += " {}".format(-lit)
+                            out_string += f" {-lit}"
                             assignment.append(-lit)
                         else:
-                            out_string += " {}".format(lit)
+                            out_string += f" {lit}"
                             assignment.append(lit)
                     print(out_string)
                     self.warmup_sol = True

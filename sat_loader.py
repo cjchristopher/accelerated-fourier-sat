@@ -153,10 +153,10 @@ class PBSATFormula(object):
                 lit_offset = 1
             if tokens[lit_offset].isalpha():
                 # First part of clause is always after the (optional) h and clause type (unless cnf)
-                clause_type = tokens[lit_offset] if tokens[lit_offset].isalpha() else "cnf"
+                clause_type = tokens[lit_offset]
                 lit_offset += 1
             canon_types = {"d": "card", "x": "xor", "n": "nae", "e": "eo"}
-            clause_type = canon_types[clause_type] if clause_type in canon_types else clause_type
+            clause_type = canon_types.get(clause_type, clause_type)
             if clause_type not in clause_type_ids:
                 logger.error(f"Unknown clause type: {line}")
                 raise ValueError
@@ -194,6 +194,11 @@ class PBSATFormula(object):
             lits = [int(val) for val in tokens[lit_offset:-1]]  # drop trailing 0
             n = len(lits)
 
+            # Clause extracted. Check for errors in spec, correct generic edge cases.
+            if n == 0:
+                throttle.debug("empty", f"Line {idx}: Skipping empty clause")
+                return
+
             if 0 in lits:
                 logger.error(f"Line {idx}: Clause literals must be non-zero integers: {line}")
                 raise ValueError
@@ -203,15 +208,9 @@ class PBSATFormula(object):
                 raise ValueError
 
             self.seen_clauses += 1
-            if n:
-                abs_lits = [abs(lit) for lit in lits]
-                self.seen_max_var = max(self.seen_max_var, max(abs_lits))
-                used_input_vars.update(abs_lits)
-
-            # Clause extracted. Check for errors in spec, correct generic edge cases.
-            if n == 0:
-                throttle.debug("empty", f"Line {idx}: Skipping empty clause")
-                return
+            abs_lits = [abs(lit) for lit in lits]
+            self.seen_max_var = max(self.seen_max_var, max(abs_lits))
+            used_input_vars.update(abs_lits)
 
             if n == 1:
                 match clause_type:
@@ -448,14 +447,60 @@ class PBSATFormula(object):
         self.n_clause = int(sum(o.clauses.lits.shape[0] for o in objectives))
         return objectives
 
-    def process_prefix(self, prefix_file: str) -> NDArray | None:
-        def __lits_to_prefix(lits: Iterable[int]) -> NDArray:
-            vec = np.zeros(self.n_var + 1, dtype=int)
-            lit_vec = np.array([int(lit) for lit in lits], dtype=int)
-            vec[abs(lit_vec[lit_vec < 0])] = 1
-            vec[abs(lit_vec[lit_vec > 0])] = -1
-            return vec
+    def _lits_to_prefix(self, lits: Iterable[int]) -> NDArray:
+        vec = np.zeros(self.n_var, dtype=int)
+        lit_vec = np.array([int(lit) for lit in lits], dtype=int)
+        vec[abs(lit_vec[lit_vec < 0]) - 1] = 1
+        vec[abs(lit_vec[lit_vec > 0]) - 1] = -1
+        return vec
 
+    def process_prefix_line(self, prefix_vars: list[str]) -> NDArray:
+        try:
+            prefix_lits_raw: set[int] = set()
+            for idx, token in enumerate(prefix_vars):
+                lit = int(token)
+                if lit == 0:
+                    if idx != len(prefix_vars) - 1:
+                        raise ValueError("Prefix literals must be non-zero integers")
+                    continue
+                if abs(lit) > INT64_MAX:
+                    raise ValueError("Prefix literal exceeds signed 64-bit range")
+                prefix_lits_raw.add(lit)
+
+            if self.compactify and self.var_mapper.input_to_dense_var:
+                prefix_lits: set[int] = set()
+                for lit in prefix_lits_raw:
+                    dense_lit = self.var_mapper.input_to_dense(lit, strict=False)
+                    if dense_lit is None or dense_lit == 0:
+                        logger.warning(f"Line {idx}: Invalid prefix literal {lit} is ignored")
+                        continue
+                    if abs(dense_lit) > self.n_var:
+                        logger.warning(
+                            f"Line {idx}: Prefix literal {lit} is out of range for loaded variables and is ignored"
+                        )
+                        continue
+                    prefix_lits.add(dense_lit)
+            else:
+                prefix_lits = prefix_lits_raw
+
+            # Invert and check for overlap implies a conflict between the problem and the prefix.
+            neg_lits = set(-lit for lit in prefix_lits)
+            self_conflict = prefix_lits.intersection(neg_lits)
+            if self_conflict:
+                #logger.warning(f"Conflict ({self_conflict}) within prefix-{idx}- skipping: {line}")
+                raise UnsatError(f"Conflict ({self_conflict}) within")
+            unit_conflict = self.unit_prefix.intersection(neg_lits)
+            if unit_conflict:
+                #logger.warning(f"Conflict ({unit_conflict}) with unit literals in prefix-{idx}- skipping: {line}")
+                raise UnsatError(f"Conflict ({unit_conflict}) with unit literals in")
+
+            merged = prefix_lits | self.unit_prefix
+            #vecs.append(__lits_to_prefix(set(sorted(merged, key=lambda x: abs(x)))))
+            return self._lits_to_prefix(set(sorted(merged, key=lambda x: abs(x))))
+        except (ValueError, TypeError):
+            raise ValueError
+
+    def process_prefix(self, prefix_file: str) -> NDArray | None:
         try:
             vecs = []
             if prefix_file:
@@ -468,64 +513,27 @@ class PBSATFormula(object):
                             continue
                         total += 1
                         try:
-                            prefix_lits_raw: set[int] = set()
-                            for idx, token in enumerate(raw_tokens):
-                                lit = int(token)
-                                if lit == 0:
-                                    if idx == len(raw_tokens) - 1:
-                                        raise ValueError("Prefix literals must be non-zero integers")
-                                    continue
-                                if abs(lit) > INT64_MAX:
-                                    raise ValueError("Prefix literal exceeds signed 64-bit range")
-                                prefix_lits_raw.add(lit)
-
-                            if self.compactify and self.var_mapper.input_to_dense_var:
-                                prefix_lits: set[int] = set()
-                                for lit in prefix_lits_raw:
-                                    dense_lit = self.var_mapper.input_to_dense(lit, strict=False) if self.compactify else lit
-                                    if dense_lit is None or dense_lit == 0:
-                                        logger.warning(f"Line {idx}: Invalid prefix literal {lit} is ignored")
-                                        continue
-                                    if abs(dense_lit) > self.n_var:
-                                        logger.warning(
-                                            f"Line {idx}: Prefix literal {lit} is out of range for loaded variables and is ignored"
-                                        )
-                                        continue
-                                    prefix_lits.add(dense_lit)
-                            else:
-                                prefix_lits = prefix_lits_raw
-
-                            # Invert and check for overlap implies a conflict between the problem and the prefix.
-                            neg_lits = set(-lit for lit in prefix_lits)
-                            self_conflict = prefix_lits.intersection(neg_lits)
-                            if self_conflict:
-                                logger.warning(f"Conflict ({self_conflict}) within prefix-{idx}- skipping: {line}")
-                                skipped += 1
-                                continue
-                            unit_conflict = self.unit_prefix.intersection(neg_lits)
-                            if unit_conflict:
-                                logger.warning(
-                                    f"Conflict ({unit_conflict}) with unit literals in prefix-{idx}- skipping: {line}"
-                                )
-                                skipped += 1
-                                continue
-
-                            merged = prefix_lits | self.unit_prefix
-                            vecs.append(__lits_to_prefix(set(sorted(merged, key=lambda x: abs(x)))))
-                        except (ValueError, TypeError):
+                            prefix_vector = self.process_prefix_line(raw_tokens)
+                            vecs.append(prefix_vector)
+                        except ValueError:
                             logger.warning(f"Line {idx}: Invalid prefix entry: {line.strip()}")
+                            skipped += 1
                             continue
+                        except UnsatError as e:
+                            logger.warning("".join(e.args) + f" prefix-{idx}- skipping: {line}")
+                            skipped += 1
+                            continue
+
                 if total > 0 and skipped == total:
                     logger.error("All prefixes skipped due to conflicts with unit literals or malformation")
                     raise UnsatError
 
             if not vecs and self.unit_prefix:
                 # No prefix file or no valid file prefixes — unit literals are the sole prefix
-                vecs.append(__lits_to_prefix(self.unit_prefix))
+                vecs.append(self._lits_to_prefix(self.unit_prefix))
 
             if vecs:
-                prefixes = np.delete(np.stack(vecs), 0, axis=1)  # purge leading zeros.
-                return prefixes
+                return np.stack(vecs)
             else:
                 return None
 
