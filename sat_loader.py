@@ -9,9 +9,9 @@ from typing import NamedTuple
 import numpy as np
 from numpy.typing import NDArray
 
-from var_mapper import VarMapper
-from boolean_whf import Clause, ClauseProcessor, Clauses, ClauseSignature, AFSAT_DFTCache, Objective, clause_type_ids
+from boolean_whf import AFSAT_DFTCache, Clause, ClauseProcessor, Clauses, ClauseSignature, Objective, clause_type_ids
 from utils import LogThrottle
+from var_mapper import VarMapper
 
 logger = logging.getLogger(__name__)
 INT64_MAX = int(np.iinfo(np.int64).max)
@@ -21,7 +21,7 @@ class UnsatError(Exception):
     pass
 
 
-class PBSATFormula(object):
+class PBSATFormula:
     """Parse and process SAT formulas from DIMACS and hybrid-constraint files.
 
     Supports CNF, XOR, NAE, AMO, EO, EK, and CARD constraints, plus optional
@@ -398,9 +398,9 @@ class PBSATFormula(object):
             sigs: list[ClauseSignature]
             clauses: Clauses
 
-        clause_grps: list[ClauseGroup] = list()
-        singletons_by_len: dict[int, list[Singleton]] = dict()
-        padded_group: list[Singleton] = list()
+        clause_grps: list[ClauseGroup] = []
+        singletons_by_len: dict[int, list[Singleton]] = {}
+        padded_group: list[Singleton] = []
         self.xor_clause_sets = []
 
         for set_signature, set_clauses in self.clause_sets.items():
@@ -484,7 +484,7 @@ class PBSATFormula(object):
                 prefix_lits = prefix_lits_raw
 
             # Invert and check for overlap implies a conflict between the problem and the prefix.
-            neg_lits = set(-lit for lit in prefix_lits)
+            neg_lits = {-lit for lit in prefix_lits}
             self_conflict = prefix_lits.intersection(neg_lits)
             if self_conflict:
                 #logger.warning(f"Conflict ({self_conflict}) within prefix-{idx}- skipping: {line}")
@@ -496,7 +496,7 @@ class PBSATFormula(object):
 
             merged = prefix_lits | self.unit_prefix
             #vecs.append(__lits_to_prefix(set(sorted(merged, key=lambda x: abs(x)))))
-            return self._lits_to_prefix(set(sorted(merged, key=lambda x: abs(x))))
+            return self._lits_to_prefix(set(merged))
         except (ValueError, TypeError):
             raise ValueError
 

@@ -679,7 +679,7 @@ def run_solver(
 
     all_sols: dict[tuple[int, ...], int] = defaultdict(int)
     first_sol: tuple[int, ...] | None = None
-    best_x = np.zeros((n_vars))
+    best_x = np.zeros(n_vars)
     ttfs = 0
     best_unsat = jnp.inf
     best_unsat_clauses_idx = np.array([0])
@@ -1041,7 +1041,7 @@ def run_solver(
                             dense_clause = ((obj.clauses.lits[find_idx] + 1) * obj.clauses.sign[find_idx]).tolist()
                         else:
                             dense_clause = ((obj.clauses.lits[find_idx] + 1) * obj.clauses.sign).tolist()
-                        clause = set(var_mapper.map_to_input(int(lit)) for lit in dense_clause if lit)
+                        clause = {var_mapper.map_to_input(int(lit)) for lit in dense_clause if lit}
                         logger.debug(f"{(sorted(clause.intersection(assignment)), clause)}")
                         break
                     else:

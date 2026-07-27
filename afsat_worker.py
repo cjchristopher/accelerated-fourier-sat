@@ -32,7 +32,7 @@ class BridgeEmitHandler(logging.Handler):
         try:
             msg = self.format(record)
             emit_log(f"pylog {msg}")
-        except Exception:
+        except Exception as e:
             return
 
 
@@ -42,7 +42,7 @@ def _close_bridge_trace_file() -> None:
         try:
             BRIDGE_TRACE_FH.flush()
             BRIDGE_TRACE_FH.close()
-        except Exception:
+        except Exception as e:
             pass
         BRIDGE_TRACE_FH = None
 
@@ -66,7 +66,7 @@ def init_bridge_trace_file(
         )
 
     try:
-        BRIDGE_TRACE_FH = open(chosen, "a", buffering=1, encoding="utf-8")
+        BRIDGE_TRACE_FH = open(chosen, "a", buffering=1, encoding="utf-8")  # noqa: SIM115
         BRIDGE_TRACE_FH.write("=== afsat bridge trace start ===\n")
         BRIDGE_TRACE_FH.flush()
         return chosen

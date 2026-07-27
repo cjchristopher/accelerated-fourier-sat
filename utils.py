@@ -108,7 +108,7 @@ class AFSATConfig:
     output_logging: OutputLoggingConfig = field(default_factory=OutputLoggingConfig)
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "AFSATConfig":
+    def from_dict(cls, data: dict[str, Any]) -> AFSATConfig:
         """Load nested AFSAT config from a dictionary."""
         return cls(
             invocation=InvocationIOConfig(**data.get("invocation", {})),
@@ -135,7 +135,7 @@ class NoveltyConfig:
     output_logging: OutputLoggingConfig = field(default_factory=OutputLoggingConfig)
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "NoveltyConfig":
+    def from_dict(cls, data: dict[str, Any]) -> NoveltyConfig:
         """Load nested novelty config from a dictionary."""
         return cls(
             invocation=InvocationIOConfig(**data.get("invocation", {})),
