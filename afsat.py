@@ -576,6 +576,7 @@ def run_solver(
     benchmark = runtime_common.benchmark
     counting = int(runtime_common.counting)
     rand_seed = runtime_common.rand_seed
+    ffsat_seed = runtime_common.ffsat_seed
     maxiters = optimiser_cfg.max_iters
     weight_decay = runtime_common.weight_decay
     unsat_h = int(runtime_common.unsat_thresh * 2 * n_vars) if runtime_common.unsat_thresh else 0
@@ -598,7 +599,7 @@ def run_solver(
     seq_evaluator, seq_verifier = seq_eval_verify(obj_eval_fns, obj_verify_fns, xor_rref_meta=xor_rref_meta)
     solver = Optimiser(seq_evaluator, seq_verifier, algorithm=optimiser, maxiter=maxiters, tol=solver_tol)
 
-    seed = int(time()) if rand_seed else 0
+    seed = int(time()) if rand_seed == -1 else rand_seed
     logger.info(f"seed={seed}, rand_seed={rand_seed}")
     # logger.debug(f"seed={seed}, rand_seed={rand_seed}")
     key = jax.random.PRNGKey(np.array(seed))
@@ -718,7 +719,11 @@ def run_solver(
         tloop = time()
 
         # Randomisation & Init
-        key, s_key = jax.random.split(key)
+        if ffsat_seed:
+            key = jax.random.PRNGKey(batches_done)
+            s_key = key
+        else:
+            key, s_key = jax.random.split(key)
         f_key, s_f_key = jax.random.split(f_key)
         x0, fixed_vars = sample_assignments(s_key, batch, n_vars, sample_method, prefix_vectors)
         x0_dev = jax.device_put(x0.copy(), batch_sharding)
@@ -1145,7 +1150,8 @@ if __name__ == "__main__":
     runtime_common_opts("-e", "--benchmark", action="store_true", field="benchmark", help="Benchmarking (less output)")
     runtime_common_opts("--progress", action="store_false", field="benchmark", help="Display progress (impl. -e False)")
     runtime_common_opts("-c", "--counting", action="store_true", field="counting", help="#SAT - Enum sols to timeout")
-    runtime_common_opts("-s", "--rand_seed", action="store_true", field="rand_seed", help="Randomise seed")
+    runtime_common_opts("-s", "--seed", type=int, field="rand_seed", help="Force initialise seed (non-negative int)")
+    runtime_common_opts("--ffseed", type=bool, field="ffsat_seed", action="store_true", help="FFSAT Key increments")
     runtime_common_opts("-u", "--unsat_thresh", type=float, field="unsat_thresh", help="MAXSAT - #UNSAT stop threshold")
     runtime_common_opts("-m", "--sampler", type=str, field="pt_sampler", choices=SAMPLERS, help="Initial point sampler")
 

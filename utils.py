@@ -49,7 +49,8 @@ class RuntimeCommonConfig:
     counting: bool = False
     benchmark: bool = True
     progress_enabled: bool = False
-    rand_seed: bool = True
+    rand_seed: int = -1
+    ffsat_seed: bool = False
     unsat_thresh: float = 0.0
     pt_sampler: str = "bias"
     restart_f: int = 1

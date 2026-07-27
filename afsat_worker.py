@@ -327,7 +327,7 @@ def main() -> None:
     runtime_common_opts = make_option_group("Runtime Common Aliases", "runtime_common")
     runtime_common_opts("-n", "--n_devices", type=int, field="n_devices", help="Number of devices")
     runtime_common_opts("-c", "--counting", action="store_true", field="counting", help="Counting mode")
-    runtime_common_opts("-s", "--rand_seed", action="store_true", field="rand_seed", help="Randomize seed")
+    runtime_common_opts("-s", "--seed", type=int, field="rand_seed", help="Force initialise seed (non-negative int)")
     runtime_common_opts("-u", "--unsat_thresh", type=float, field="unsat_thresh", help="Threshold for early stop")
     runtime_common_opts("-m", "--sample_meth", type=str, field="sample_method", choices=SAMPLERS, help="Sampler")
 
