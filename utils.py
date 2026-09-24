@@ -65,6 +65,8 @@ class RuntimeAFSATConfig:
     fuzz: int = 0
     warmup: bool = True
     xor_rref: bool = True
+    propagate: bool = True  # full-formula unit propagation before the JAX stage
+    drop_xor_eval: bool = True  # skip the XOR objective when the RREF projector satisfies it by construction
 
 
 @dataclass

@@ -21,10 +21,21 @@ logger = logging.getLogger(__name__)
 
 
 class XorRREFMetadata(NamedTuple):
-    rref_free_part: Array
-    b_final: Array
-    dependent_indices: Array
-    free_indices: Array
+    """RREF of the XOR system in padded index form.
+
+    Row i determines variable `dependent_indices[i]` as the XOR of the free variables
+    `row_vars[i, row_mask[i]]` plus `b_final[i]`. Rows are padded to K = the maximum row
+    weight, mirroring `clauses.lits` / `clauses.mask`. RREF rows are sparse in practice
+    (mean weight ~3 on SHA-1), so this is two orders of magnitude smaller than the dense
+    (n_dep, n_free) coefficient block, which is almost entirely zeros.
+    """
+
+    row_vars: Array  # (n_dep, K) int32 variable ids of each row's free support, padded
+    row_mask: Array  # (n_dep, K) bool, False on padding
+    row_sign: Array  # (n_dep,) 1 - 2 * b_final
+    b_final: Array  # (n_dep,)
+    dependent_indices: Array  # (n_dep,)
+    free_indices: Array  # (n_free,) host bookkeeping; not read by the projector
     clause_count: int
     variable_count: int
 
@@ -182,6 +193,22 @@ def _rref_gf2_numpy(matrix: NDArray, parity: NDArray) -> tuple[NDArray, NDArray,
     return coeff, rhs, inconsistent
 
 
+def _padded_row_supports(free_part: NDArray, free_idx: NDArray) -> tuple[NDArray, NDArray]:
+    """Convert the dense (n_dep, n_free) 0/1 block into padded (n_dep, K) variable ids + mask."""
+    n_dep = free_part.shape[0]
+    rows, cols = np.nonzero(free_part)
+    counts = np.bincount(rows, minlength=n_dep)
+    width = max(int(counts.max()) if counts.size else 0, 1)
+    offsets = np.concatenate([[0], np.cumsum(counts)[:-1]]) if n_dep else np.zeros(0, dtype=np.int64)
+    positions = np.arange(rows.size) - offsets[rows]
+
+    row_vars = np.zeros((n_dep, width), dtype=np.int32)
+    row_mask = np.zeros((n_dep, width), dtype=bool)
+    row_vars[rows, positions] = free_idx[cols]
+    row_mask[rows, positions] = True
+    return row_vars, row_mask
+
+
 def _build_xor_rref_metadata_from_matrix(
     matrix: NDArray, parity: NDArray, xor_vars: list[int], clause_count: int
 ) -> tuple[XorRREFMetadata | None, dict[int, int], bool]:
@@ -217,7 +244,7 @@ def _build_xor_rref_metadata_from_matrix(
     if active_rows.size == 0:
         dep_idx = np.array([], dtype=np.int32)
         free_idx = xor_vars_np
-        free_part = np.zeros((0, n_cols), dtype=np.float32)
+        free_part = np.zeros((0, n_cols), dtype=np.uint8)
         b_final = np.zeros((0,), dtype=np.float32)
     else:
         dep_local = np.array([int(np.argmax(coeff[row])) for row in active_rows], dtype=np.int32)
@@ -227,7 +254,7 @@ def _build_xor_rref_metadata_from_matrix(
 
         dep_idx = xor_vars_np[dep_local]
         free_idx = xor_vars_np[free_local]
-        free_part = coeff[np.ix_(active_rows, free_local)].astype(np.float32)
+        free_part = coeff[np.ix_(active_rows, free_local)].astype(np.uint8)
         b_final = rhs[active_rows].astype(np.float32)
 
     # Rows the reduction leaves with no free support force their dependent outright.
@@ -258,8 +285,11 @@ def _build_xor_rref_metadata_from_matrix(
         if free_idx.size <= 64:
             logger.info("XOR free vars (0-indexed): %s", free_idx.tolist())
 
+    row_vars, row_mask = _padded_row_supports(free_part, free_idx)
     meta = XorRREFMetadata(
-        rref_free_part=jnp.array(free_part),
+        row_vars=jnp.array(row_vars),
+        row_mask=jnp.array(row_mask),
+        row_sign=jnp.array(1.0 - 2.0 * b_final, dtype=np.float32),
         b_final=jnp.array(b_final),
         dependent_indices=jnp.array(dep_idx),
         free_indices=jnp.array(free_idx),

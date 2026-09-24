@@ -79,12 +79,13 @@ from tqdm.auto import tqdm
 from boolean_whf import Objective
 from samplers import SAMPLERS, sample_assignments
 from sat_loader import PBSATFormula, UnsatError
-from solvers import Optimiser, build_eval_verify, seq_eval_verify
+from solvers import Optimiser, build_eval_verify, drop_projected_xor_evaluators, seq_eval_verify
 from utils import (
     LOG_LEVELS,
     AFSATConfig,
     get_gpu_l2_cache_size,
 )
+from propagation import propagate_units
 from var_mapper import VarMapper
 from xor_rref import (
     XorRREFMetadata,
@@ -192,6 +193,24 @@ def adjust_batch(devices: list, batch: int, target: int, est_mem_per_point: int,
     return opt_batch
 
 
+def pin_warmup_inputs(x: Array, prefix_vectors: Array | None) -> tuple[Array, Array]:
+    """Apply the run's prefixes to warmup data, exactly as sample_assignments does for real batches.
+
+    Warmup must see the same fixed variables as the real run, for two reasons. Correctness: unit
+    clauses exist only as the prefix (the loader strips them from the clause arrays), so an
+    unpinned warmup can "solve" the instance while violating them. And cost: sample_assignments
+    returns a (batch, n_vars) mask whenever prefixes exist, so a (batch, 1) warmup mask compiles a
+    different program and the first real batch recompiles -- also leaving the unroll retune
+    tuned to a program that is never run.
+    """
+    if prefix_vectors is None:
+        return x, jnp.full((x.shape[0], 1), fill_value=False, dtype=bool)
+    # Warmup batch sizes need not divide by the prefix count; cycle the rows instead.
+    replicated = jnp.resize(jnp.asarray(prefix_vectors), (x.shape[0], x.shape[1])).astype(x.dtype)
+    fixed = replicated != 0
+    return jnp.where(fixed, replicated, x), fixed
+
+
 @dataclass
 class AFSATProblem:
     problem_file: str
@@ -267,6 +286,24 @@ def prepare_problem(
     maxsatish_mode = bool(config.runtime_common.counting or config.runtime_common.unsat_thresh)
     objectives = sat_parser.process_clauses_to_array()
     xor_rref_meta: XorRREFMetadata | None = None
+    if config.runtime_afsat.propagate:
+        prop1 = time()
+        propagated = propagate_units(sat_parser.clause_sets, sat_parser.unit_prefix)
+        logger.info(f"X-PROPTIME {time() - prop1}")
+        if propagated.unsat:
+            if not maxsatish_mode:
+                print("s UNSATISFIABLE")
+                raise UnsatError("Formula is inconsistent under unit propagation")
+            logger.warning("Unit propagation found a conflict; continuing with the unpropagated prefix")
+        elif propagated.derived:
+            # Implied literals only need to reach fixed_vars/x0: no clause array is rewritten, a
+            # clause the propagation satisfied simply evaluates as satisfied under the pin.
+            sat_parser.unit_prefix |= propagated.derived
+            logger.info(
+                f"Unit propagation implied {len(propagated.derived)} further literals; "
+                f"unit prefix is now {len(sat_parser.unit_prefix)} of {sat_parser.n_var} variables"
+            )
+
     # Unit propagation over the XOR system is problem simplification, not projection, so it
     # runs whenever there are XOR clauses. Only the second tier -- dependents the reduction
     # forces outright, which need a linear combination of clauses to expose -- is gated on
@@ -379,6 +416,10 @@ def create_worker_session(
     key = jax.random.PRNGKey(np.array(seed))
     f_key = jax.random.PRNGKey(np.array(seed + 1))
 
+    # Every worker request goes through process_prefix_line, which always yields a (n_vars,)
+    # vector with the unit prefix merged in; warm up on exactly that (zeros if there are no units).
+    unit_vector = jnp.asarray(prepared.sat_parser.process_prefix_line([]))[None, :]
+
     batch = runtime_afsat.batch_per_device
     guess_batch = 0
     if batch == -1:
@@ -396,20 +437,20 @@ def create_worker_session(
             [np.prod([max(o.clauses.lits.shape), max(o.ffts.dft.shape) ** 2, dtype_sz]) for o in sharded_objs]
         )
         if xor_rref_meta is not None:
-            all_obj_sz += int(np.prod(np.asarray(xor_rref_meta.rref_free_part.shape)))
+            # Bytes, like the objective term above -- this previously added an element count.
+            all_obj_sz += sum(int(a.nbytes) for a in (xor_rref_meta.row_vars, xor_rref_meta.row_mask))
         guess_batch = int(np.floor(gpu_mem_target / all_obj_sz)) * n_devices
         guess_batch -= guess_batch % n_devices
         guess_batch = max(guess_batch, n_devices)
         trace(f"heuristic guess_batch={guess_batch}")
 
         trace("materializing x_guess")
-        x_guess = jax.device_put(
+        x_guess, empty_prefix = pin_warmup_inputs(
             jax.random.uniform(key, minval=0.99 - (5e-2), maxval=0.99, shape=(guess_batch, n_vars)),
-            batch_sharding,
+            unit_vector,
         )
-        empty_prefix = jax.device_put(
-            jnp.full((guess_batch, prefix_count), fill_value=False, dtype=bool), batch_sharding
-        )
+        x_guess = jax.device_put(x_guess, batch_sharding)
+        empty_prefix = jax.device_put(empty_prefix, batch_sharding)
         w_guess = tuple((w - 1e-4) for w in weights)
         trace("estimating peak memory")
         peak_mem = solver.peak_memory_estimation(x_guess, empty_prefix, w_guess)
@@ -429,11 +470,12 @@ def create_worker_session(
         trace("warmup enabled")
         if guess_batch != batch:
             trace("rematerializing warmup arrays for adjusted batch")
-            x_guess = jax.device_put(
+            x_guess, empty_prefix = pin_warmup_inputs(
                 jax.random.uniform(f_key, minval=0.99 - (5e-2), maxval=0.99, shape=(batch, n_vars)),
-                batch_sharding,
+                unit_vector,
             )
-            empty_prefix = jax.device_put(jnp.full((batch, 1), fill_value=False, dtype=bool), batch_sharding)
+            x_guess = jax.device_put(x_guess, batch_sharding)
+            empty_prefix = jax.device_put(empty_prefix, batch_sharding)
         trace("estimating warmup peak memory")
         peak_mem = int(solver.peak_memory_estimation(x_guess, empty_prefix, weights))
         target_bytes = max(int(gpu_mem_target), 1)
@@ -635,6 +677,16 @@ def run_solver(
 
     # Construct pure JAX functions (closures) and build solver.
     obj_eval_fns, obj_verify_fns = build_eval_verify(objs, optimiser == "unbounded")
+    if runtime_afsat.drop_xor_eval and xor_rref_meta is not None and optimiser != "unbounded":
+        # The projector satisfies every XOR clause by construction -- unless a prefix fixes an
+        # RREF dependent, in which case that row is only enforced by the objective, so keep it.
+        dep_idx = np.asarray(xor_rref_meta.dependent_indices)
+        fixed_dep = 0 if prefix_vectors is None else int(np.any(np.asarray(prefix_vectors)[:, dep_idx] != 0, axis=0).sum())
+        if fixed_dep:
+            logger.info(f"Keeping XOR objective: prefixes fix {fixed_dep} RREF dependent variables")
+        else:
+            obj_eval_fns, n_dropped = drop_projected_xor_evaluators(objs, obj_eval_fns)
+            logger.info(f"XOR objective handled by RREF projection; dropped {n_dropped} evaluator(s)")
     seq_evaluator, seq_verifier = seq_eval_verify(obj_eval_fns, obj_verify_fns, xor_rref_meta=xor_rref_meta)
     solver = Optimiser(seq_evaluator, seq_verifier, algorithm=optimiser, maxiter=maxiters, tol=solver_tol)
 
@@ -663,16 +715,18 @@ def run_solver(
         dtype_sz = jnp.dtype(objs[0].ffts.dft.dtype).itemsize
         all_obj_sz = sum([np.prod([max(o.clauses.lits.shape), max(o.ffts.dft.shape) ** 2, dtype_sz]) for o in objs])
         if xor_rref_meta is not None:
-            all_obj_sz += int(np.prod(np.asarray(xor_rref_meta.rref_free_part.shape)))
+            # Bytes, like the objective term above -- this previously added an element count.
+            all_obj_sz += sum(int(a.nbytes) for a in (xor_rref_meta.row_vars, xor_rref_meta.row_mask))
         guess_batch = int(np.floor(gpu_mem_target / (all_obj_sz))) * n_devices
         guess_batch -= guess_batch % n_devices
         guess_batch = max(guess_batch, n_devices)  # Ensure at least 1 per device
         logger.info(f"Initial batch size guess: {guess_batch}")
 
-        x_guess = jax.device_put(
-            jax.random.uniform(key, minval=0.99 - (5e-2), maxval=0.99, shape=(guess_batch, n_vars)), batch_sharding
+        x_guess, empty_prefix = pin_warmup_inputs(
+            jax.random.uniform(key, minval=0.99 - (5e-2), maxval=0.99, shape=(guess_batch, n_vars)), prefix_vectors
         )
-        empty_prefix = jax.device_put(jnp.full((guess_batch, n_prefix), fill_value=False, dtype=bool), batch_sharding)
+        x_guess = jax.device_put(x_guess, batch_sharding)
+        empty_prefix = jax.device_put(empty_prefix, batch_sharding)
         w_guess = tuple((w - 1e-4) for w in weights)
         peak_mem = solver.peak_memory_estimation(x_guess, empty_prefix, w_guess)
         mem_est_per_point = peak_mem // guess_batch
@@ -686,10 +740,11 @@ def run_solver(
     if warmup:
         if guess_batch != batch:
             # Size changed, so we need new arrays for warmup
-            x_guess = jax.device_put(
-                jax.random.uniform(f_key, minval=0.99 - (5e-2), maxval=0.99, shape=(batch, n_vars)), batch_sharding
+            x_guess, empty_prefix = pin_warmup_inputs(
+                jax.random.uniform(f_key, minval=0.99 - (5e-2), maxval=0.99, shape=(batch, n_vars)), prefix_vectors
             )
-            empty_prefix = jax.device_put(jnp.full((batch, 1), fill_value=False, dtype=bool), batch_sharding)
+            x_guess = jax.device_put(x_guess, batch_sharding)
+            empty_prefix = jax.device_put(empty_prefix, batch_sharding)
 
         if not benchmark and logger.isEnabledFor(logging.INFO):
             if mesh.shape["batch"] > 1:
@@ -712,7 +767,10 @@ def run_solver(
         solver.warmup((x_guess, empty_prefix, weights), bool(counting))
         warm_end = time()
         if not counting and solver.warmup_sol:
-            # Found a solution during warmup which we have printed. Exit now.
+            # Found a solution during warmup. Report it in the standard form and exit.
+            signed = tuple(np.sign(np.asarray(solver.warmup_x)).astype(int).tolist())
+            print("s SATISFIABLE")
+            print(f"v {var_mapper.assn_str(signed, binary_v)} 0")
             logger.info(f"W-TTFS {warm_end - warm_start}")
             logger.info(f"W-XT {warm_end - warm_start}")
             return warm_end - warm_start
@@ -1199,6 +1257,12 @@ if __name__ == "__main__":
     runtime_afsat_opts("-f", "--fuzz", type=int, field="fuzz", help="Number of times to attempt fuzzing per batch")
     runtime_afsat_opts("-w", "--warmup", action="store_true", field="warmup", help="Warmup (dummy run) kernel")
     runtime_afsat_opts("--xor_rref", action="store_true", field="xor_rref", help="Enable XOR GJ Elim (RREF projection)")
+    runtime_afsat_opts(
+        "--no_propagate", action="store_false", field="propagate", help="Disable full-formula unit propagation"
+    )
+    runtime_afsat_opts(
+        "--keep_xor_eval", action="store_false", field="drop_xor_eval", help="Keep the XOR objective under RREF"
+    )
 
     optimiser_opts = make_option_group("Optimiser Aliases", "optimiser")
     optimiser_opts("-i", "--iters_desc", type=int, field="max_iters", help="Solver maximum iterations")

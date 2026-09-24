@@ -72,29 +72,32 @@ def _bind_unsat_rule(template: UnsatRule, mask: Array, cards: Array) -> Callable
 
 
 def _make_xor_projector(meta: XorRREFMetadata) -> Callable[[Array], Array]:
-    free_part = meta.rref_free_part
-    b_final = meta.b_final
+    """Overwrite each RREF dependent with the value its row derives from the free variables.
+
+    Row i asserts `x_dep = (1 - 2 b_i) * prod_{j in row} x_j`. That single product carries both
+    the sign (an odd number of negative factors is exactly odd GF(2) parity) and the multilinear
+    magnitude, and its gradient is the exact product rule -- defined everywhere, including at 0,
+    so no log/exp detour or magnitude clip is needed.
+
+    The one thing the bare product gets wrong is its *sign* when a factor is exactly 0: the
+    product is then 0, which the verifier reads as FALSE whatever the parity says. The
+    `parity_sign * tiny` term fixes that. Whenever the product is non-zero it has the same sign
+    as the product (so it only perturbs the magnitude by `tiny`), when the product is 0 it
+    supplies the parity sign alone, and it is piecewise constant, so gradients are untouched.
+    """
+    row_vars = meta.row_vars
+    row_mask = meta.row_mask
+    row_sign = meta.row_sign
     dep_idx = meta.dependent_indices
-    free_idx = meta.free_indices
-    n_free = int(meta.free_indices.shape[0])
 
     def project(x: Array) -> Array:
-        x_free = x[free_idx]
         dtype = x.dtype
-        free_part_t = free_part.astype(dtype)
-        b_final_t = b_final.astype(dtype)
-
-        binary_free = (x_free < 0).astype(dtype)
-        row_parity = jnp.mod(jnp.dot(free_part_t, binary_free) + b_final_t, 2.0)
-        dep_signs = 1.0 - 2.0 * row_parity
-
-        if n_free == 0:
-            dep_mags = jnp.ones_like(dep_signs)
-        else:
-            log_mags = jnp.log(jnp.clip(jnp.abs(x_free), 1e-7, 1.0))
-            dep_mags = jnp.exp(jnp.dot(free_part_t, log_mags))
-
-        x_dep = dep_signs * dep_mags
+        sign = row_sign.astype(dtype)
+        xs = x[row_vars]  # (n_dep, K)
+        product = jnp.prod(jnp.where(row_mask, xs, 1.0), axis=-1)
+        negatives = jnp.sum((xs < 0) & row_mask, axis=-1)
+        parity_sign = sign * (1.0 - 2.0 * (negatives % 2)).astype(dtype)
+        x_dep = sign * product + parity_sign * jnp.finfo(dtype).tiny
         return x.at[dep_idx].set(x_dep)
 
     return project
@@ -188,6 +191,33 @@ def build_eval_verify(objs: tuple[Objective, ...], unbounded: bool) -> tuple[tup
     verify_fns: tuple[VerifyFn]
     eval_fns, verify_fns = zip(*[single_eval_verify(obj) for obj in objs])
     return eval_fns, verify_fns
+
+
+def drop_projected_xor_evaluators(
+    objs: tuple[Objective, ...], eval_fns: tuple[EvalFn, ...]
+) -> tuple[tuple[EvalFn, ...], int]:
+    """Replace the evaluator of every all-XOR objective with a zero cost.
+
+    Only valid while the RREF projector owns those clauses, i.e. every XOR clause is satisfied
+    by construction -- which fails if a prefix fixes an RREF dependent, so the caller must check
+    that first. The verifiers are untouched, and each objective keeps its slot, so `weights`
+    stays index-aligned with the reweighting loop.
+
+    Returns the new evaluators and how many objectives were dropped.
+    """
+    xor_id = clause_type_ids["xor"]
+
+    def zero_cost(x: Array, fixed_vars: Array, weight: Array) -> Array:
+        return jnp.zeros((1,), dtype=x.dtype)
+
+    new_fns, dropped = [], 0
+    for obj, fn in zip(objs, eval_fns):
+        if bool(np.all(np.asarray(obj.clauses.types).reshape(-1) == xor_id)):
+            new_fns.append(zero_cost)
+            dropped += 1
+        else:
+            new_fns.append(fn)
+    return tuple(new_fns), dropped
 
 
 def seq_eval_verify(
@@ -287,6 +317,7 @@ class Optimiser(abc.ABC):
         self.algo = algorithm
         self.maxiter = maxiter
         self.warmup_sol = False
+        self.warmup_x: NDArray | None = None
         self.unroll = unroll
         # Kept so warmup can rebuild the solver once it has seen real iteration counts.
         self._build_args = (evaluator, verifier, algorithm, maxiter, tol)
@@ -503,18 +534,9 @@ class Optimiser(abc.ABC):
                 loc = jnp.argmin(batch_unsat_scores)
                 best_x = opt_x0[loc]
                 if batch_best == 0:
-                    print(f"Found a solution in warmup! SAT at index {loc}")
-                    out_string = "v"
-                    assignment = []
-                    for i in range(x0.shape[-1]):
-                        lit = i + 1
-                        if best_x[i] > 0:
-                            out_string += f" {-lit}"
-                            assignment.append(-lit)
-                        else:
-                            out_string += f" {lit}"
-                            assignment.append(lit)
-                    print(out_string)
+                    # The caller prints it: only it knows the variable mapping and output format.
+                    logger.info(f"Found a solution in warmup at index {loc}")
+                    self.warmup_x = np.asarray(best_x)
                     self.warmup_sol = True
 
             logger.info(f"Warmup Complete {time() - t0}")
