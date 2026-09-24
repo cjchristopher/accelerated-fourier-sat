@@ -84,6 +84,7 @@ def emit_line(line: str) -> None:
     if BRIDGE_TRACE_FH is not None:
         BRIDGE_TRACE_FH.write(line + "\n")
         BRIDGE_TRACE_FH.flush()
+    # print("wrote line", flush=True)
 
 
 def emit_bridge_line(command: str, lits: np.ndarray) -> None:
@@ -108,6 +109,7 @@ def parse_prefix_line(line: str) -> tuple[np.ndarray, bool]:
     command = parts[0].upper()
 
     if command == "STOP":
+        emit_log("STOP RECEIVED")
         return np.empty(0, dtype=np.intc), True
 
     if command != "PREFIX":
@@ -118,6 +120,7 @@ def parse_prefix_line(line: str) -> tuple[np.ndarray, bool]:
 
     try:
         length = int(parts[1])
+        # emit_log(f"got length {length}")
     except ValueError as exc:
         raise ValueError(f"invalid PREFIX length: {parts[1]}") from exc
 
@@ -132,27 +135,14 @@ def parse_prefix_line(line: str) -> tuple[np.ndarray, bool]:
         return np.empty(0, dtype=np.intc), True
 
     try:
+        # emit_log(f"attemptings get lits {type(lits_text)}, {len(lits_text)}")
+        # emit_log(f"attemptings get lits {" ".join(lits_text)[:100]} ...")
         lits = np.asarray([int(x) for x in lits_text[:length]], dtype=np.intc)
+        # emit_log(f"got lits {lits}")
     except ValueError as exc:
         raise ValueError("PREFIX contains non-integer literal") from exc
-
+    # emit_log(f"returning")
     return lits, False
-
-
-def prefix_lits_to_numpy_vector(prefix_lits: np.ndarray, vc: int) -> np.ndarray:
-    """Map signed literals to AFSAT assignment convention in {-1, 0, +1}.
-
-    AFSAT convention:
-      +literal -> -1
-      -literal -> +1
-    """
-    x = np.zeros(vc, dtype=np.int8)
-    if prefix_lits.size == 0:
-        return x
-
-    idx = np.abs(prefix_lits) - 1
-    x[idx] = np.where(prefix_lits > 0, -1, 1).astype(np.int8)
-    return x
 
 
 def assignment_vector_to_lits(assign_vec: np.ndarray) -> np.ndarray:
@@ -190,12 +180,13 @@ def run_worker(
     )
     worker_time = time()
 
-    vc = prepared.n_var
+    n_units = len(prepared.sat_parser.unit_prefix)
 
     emit_log(
         f"Worker ready | world_rank={world_rank} helper_rank={helper_rank}/{helper_count} "
         f"vars={prepared.n_var} clauses={prepared.n_clause} batch={session.batch} "
-        f"read={read_time:.3f}s process={process_time:.3f}s warmup={int(session.warmup_done)}"
+        f"units={n_units} read={read_time:.3f}s process={process_time:.3f}s "
+        f"warmup={int(session.warmup_done)}"
     )
     emit_log(
         f"Elapsed | prep={prep_time - start_time:.3f} "
@@ -208,57 +199,18 @@ def run_worker(
     )
     emit_line("READY")
 
-    # while True:
-    #     raw = sys.stdin.readline()
-    #     if raw == "":
-    #         emit_log("Bridge stdin closed; exiting")
-    #         return
-
-    #     try:
-    #         prefix_lits, stop = parse_prefix_line(raw)
-    #         emit_log("Received Prefix from Dagster")
-    #         if stop:
-    #             emit_log("Stop command received; shutting down worker loop")
-    #             return
-
-    #         if prefix_lits.size == 0:
-    #             continue
-
-    #         prefix_vector = prefix_lits_to_numpy_vector(prefix_lits, vc)
-    #         prefix_vectors = jnp.asarray(prefix_vector)[None, :]
-    #         result = run_worker_single_batch(session, prefix_vectors)
-
-    #         assign_vec_full = np.asarray(result.best_assignment_signed, dtype=np.int8)
-    #         # Suggestions should not simply repeat fixed prefix literals.
-    #         assign_vec_suggest = assign_vec_full.copy()
-    #         assign_vec_suggest[np.abs(prefix_lits) - 1] = 0
-
-    #         lits = assignment_vector_to_lits(assign_vec_suggest)
-    #         max_suggestions = max(int(suggestion_size), 0)
-    #         suggestion_lits = lits[:max_suggestions]
-    #         emit_bridge_line("SUGGEST", suggestion_lits)
-
-    #         if result.sat:
-    #             solution_lits = assignment_vector_to_lits(assign_vec_full)
-    #             emit_bridge_line("SOLUTION", solution_lits)
-
-    #     except UnsatError as err:
-    #         logger.warning("Skipping conflicting/unsat prefix: %s", err)
-    #         emit_log(f"unsat_prefix {err}")
-
-    #     except Exception:
-    #         logger.exception("Worker request failed")
-    #         raise
-
     while True:
+        # emit_log("reading next line...")
         raw = sys.stdin.readline()
+        # emit_log(f"read {raw[:100]} [...]")
         if raw == "":
             emit_log("Bridge stdin closed; exiting")
             return
 
         try:
+            # emit_log("Attempt prefix parse")
             prefix_lits, stop = parse_prefix_line(raw)
-            emit_log("Received Prefix from Dagster")
+            # emit_log("Received Prefix from Dagster")
             if stop:
                 emit_log("Stop command received; shutting down worker loop")
                 return
@@ -266,30 +218,42 @@ def run_worker(
             if prefix_lits.size == 0:
                 continue
 
-            prefix_vector = prefix_lits_to_numpy_vector(prefix_lits, vc)
+            # emit_log("Prefix valid, running optimser")
+            # Go through the loader rather than mapping the literals here. It merges the
+            # problem-implied unit literals into the prefix (the loader strips unit clauses
+            # from the clause arrays, so nothing else enforces them) and raises UnsatError
+            # when the cube contradicts one of them or itself.
+            prefix_vector = prepared.sat_parser.process_prefix_line([str(int(v)) for v in prefix_lits.tolist()])
             prefix_vectors = jnp.asarray(prefix_vector)[None, :]
             result = run_worker_single_batch(session, prefix_vectors)
 
-            assign_vec = np.asarray(result.best_assignment_signed, dtype=np.int8)
-            # Do not echo the fixed prefix literals back to the controller.
-            assign_vec[np.abs(prefix_lits) - 1] = 0
+            assign_vec_full = np.asarray(result.best_assignment_signed, dtype=np.int8)
+            # Suggestions should not simply repeat fixed literals. That means every fixed
+            # position, not just the received cube: the merged unit literals would otherwise
+            # consume the whole suggestion budget with values the caller already knows.
+            assign_vec_suggest = assign_vec_full.copy()
+            assign_vec_suggest[np.asarray(prefix_vector) != 0] = 0
 
-            lits = assignment_vector_to_lits(assign_vec)
+            lits = assignment_vector_to_lits(assign_vec_suggest)
             max_suggestions = max(int(suggestion_size), 0)
             suggestion_lits = lits[:max_suggestions]
             emit_bridge_line("SUGGEST", suggestion_lits)
 
             if result.sat:
-                emit_line(" ".join([str(l) for l in lits]))
-                emit_bridge_line("SOLUTION", lits)
+                solution_lits = assignment_vector_to_lits(assign_vec_full)
+                emit_bridge_line("SOLUTION", solution_lits)
 
         except UnsatError as err:
             logger.warning("Skipping conflicting/unsat prefix: %s", err)
             emit_log(f"unsat_prefix {err}")
 
-        except Exception:
-            logger.exception("Worker request failed")
-            raise
+        except Exception as err:
+            # Don't tear the worker down on a single bad request. The C bridge
+            # would relaunch us and we'd likely re-hit the same failure, burning
+            # the relaunch budget. Log and keep serving the next prefix, exactly
+            # as we do for an UnsatError.
+            logger.exception("Worker request failed; skipping prefix")
+            emit_log(f"request_failed {err}")
 
 
 def main() -> None:
@@ -327,7 +291,7 @@ def main() -> None:
     runtime_common_opts = make_option_group("Runtime Common Aliases", "runtime_common")
     runtime_common_opts("-n", "--n_devices", type=int, field="n_devices", help="Number of devices")
     runtime_common_opts("-c", "--counting", action="store_true", field="counting", help="Counting mode")
-    runtime_common_opts("-s", "--seed", type=int, field="rand_seed", help="Force initialise seed (non-negative int)")
+    runtime_common_opts("-s", "--seed", default=156322, type=int, field="rand_seed", help="Force initialise seed (non-negative int)")
     runtime_common_opts("-u", "--unsat_thresh", type=float, field="unsat_thresh", help="Threshold for early stop")
     runtime_common_opts("-m", "--sample_meth", type=str, field="sample_method", choices=SAMPLERS, help="Sampler")
 

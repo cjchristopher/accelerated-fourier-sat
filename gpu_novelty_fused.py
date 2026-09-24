@@ -434,7 +434,7 @@ def run_beam_search(
     mesh, batch_sharding = get_mesh(devices)
     jax.sharding.set_mesh(mesh)
 
-    seed = int(time()) if rand_seed else 42
+    seed = int(time()) if rand_seed == -1 else rand_seed
     logger.info(f"seed={seed}, rand_seed={rand_seed}")
     rng_key = jax.random.PRNGKey(seed)
     rng_key, init_key = jax.random.split(rng_key)
@@ -840,7 +840,7 @@ if __name__ == "__main__":
     runtime_common_opts("-t", "--timeout", type=int, field="timeout_sec", help="Timeout in seconds")
     runtime_common_opts("-g", "--gpus", type=int, field="n_devices", help="Number of GPUs")
     runtime_common_opts("-c", "--counting", action="store_true", field="counting", help="Count solutions mode")
-    runtime_common_opts("-s", "--seed", action="store_true", field="rand_seed", help="Random seed from time")
+    runtime_common_opts("-s", "--seed", type=int, field="rand_seed", help="Force initialise seed (non-negative int)")
     runtime_common_opts("-m", "--sampler", type=str, field="pt_sampler", choices=SAMPLERS, help="Initial point sampler")
     runtime_common_opts("-r", "--restart_f", type=int, field="restart_f", help="Batches before reweighting (0 = never)")
     runtime_common_opts("-a", "--alpha", type=float, field="weight_decay", help="Weight decay (0.0-1.0)")

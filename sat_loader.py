@@ -54,7 +54,6 @@ class PBSATFormula:
         disk_cache: str = "",
         file: str = "",
         compactify: bool = True,
-        xor_rref: bool = False,
     ) -> None:
         self.clause_sets: dict[ClauseSignature, Clauses] = {}
         self.n_devices: int = n_devices
@@ -68,7 +67,6 @@ class PBSATFormula:
         self.seen_max_var: int = 0
         self.seen_clauses: int = 0
         self._loaded_file: str | None = None
-        self.xor_rref: bool = xor_rref
         self.xor_clause_sets: list[Clauses] = []
         if disk_cache:
             self.disk_cache = AFSAT_DFTCache(disk_cache)
@@ -404,7 +402,10 @@ class PBSATFormula:
         self.xor_clause_sets = []
 
         for set_signature, set_clauses in self.clause_sets.items():
-            if self.xor_rref and set_signature.type == "xor":
+            # Collected unconditionally: the xor_rref flag gates the RREF *projection*, but
+            # unit propagation over the XOR system is plain problem simplification and runs
+            # either way. These are references to clause lists that already exist.
+            if set_signature.type == "xor":
                 self.xor_clause_sets.append(set_clauses)
 
             # Gather singletons by common length for more efficient processing

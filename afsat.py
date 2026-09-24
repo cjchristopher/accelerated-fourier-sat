@@ -86,7 +86,12 @@ from utils import (
     get_gpu_l2_cache_size,
 )
 from var_mapper import VarMapper
-from xor_rref import XorRREFMetadata, build_xor_rref_metadata_from_clause_sets
+from xor_rref import (
+    XorRREFMetadata,
+    literals_from_unit_bits,
+    preprocess_xor_system,
+    unit_bits_from_literals,
+)
 
 logger = logging.getLogger(__name__)
 QUIT_ON_ANOMALY = False
@@ -238,7 +243,13 @@ def prepare_problem(
     config: AFSATConfig,
     *,
     prefix_file: str | None = None,
+    trace_hook: Callable[[str], None] | None = None,
 ) -> tuple[AFSATProblem, Array | None, float, float]:
+    def trace(message: str) -> None:
+        if trace_hook is None:
+            return
+        trace_hook(message)
+
     if not problem_file:
         raise ValueError("No problem file specified")
 
@@ -249,7 +260,6 @@ def prepare_problem(
         disk_cache=config.invocation.disk_cache,
         file=problem_file,
         compactify=False,
-        xor_rref=config.runtime_afsat.xor_rref,
     )
     stamp2 = time()
     read_time = stamp2 - stamp1
@@ -257,14 +267,43 @@ def prepare_problem(
     maxsatish_mode = bool(config.runtime_common.counting or config.runtime_common.unsat_thresh)
     objectives = sat_parser.process_clauses_to_array()
     xor_rref_meta: XorRREFMetadata | None = None
-    if config.runtime_afsat.xor_rref and sat_parser.xor_clause_sets:
-        xor_rref_meta = build_xor_rref_metadata_from_clause_sets(sat_parser.xor_clause_sets)
-        if xor_rref_meta is None:
+    # Unit propagation over the XOR system is problem simplification, not projection, so it
+    # runs whenever there are XOR clauses. Only the second tier -- dependents the reduction
+    # forces outright, which need a linear combination of clauses to expose -- is gated on
+    # the RREF actually being built.
+    if sat_parser.xor_clause_sets:
+        xor1 = time()
+        xor_result = preprocess_xor_system(
+            sat_parser.xor_clause_sets,
+            unit_bits_from_literals(sat_parser.unit_prefix),
+            build_rref=config.runtime_afsat.xor_rref,
+        )
+        xor_rref_meta = xor_result.meta
+        xor2 = time()
+        logger.info(f"X-XORPROCTIME {xor2 - xor1}")
+        # print(f"X-XORPROCTIME {xor2 - xor1}", flush=True)
+        if xor_result.unsat:
             if not maxsatish_mode:
                 print("s UNSATISFIABLE")
-                raise UnsatError("XOR subsystem is inconsistent under RREF preprocessing")
+                raise UnsatError("XOR subsystem is inconsistent under preprocessing")
+            logger.warning("XOR preprocessing found a conflict; continuing without XOR projection")
+        else:
+            if xor_result.derived:
+                # Propagation implied further literals. They must reach fixed_vars/x0, and
+                # both process_prefix (just below) and process_prefix_line merge unit_prefix
+                # into every prefix, so extending it here is all that is needed. This must
+                # stay ahead of the process_prefix call.
+                sat_parser.unit_prefix |= set(literals_from_unit_bits(xor_result.derived))
+                logger.info(
+                    f"XOR unit propagation implied {len(xor_result.derived)} further literals; "
+                    f"unit prefix is now {len(sat_parser.unit_prefix)}"
+                )
+            if xor_rref_meta is None:
+                if config.runtime_afsat.xor_rref:
+                    logger.info("XOR system fully determined by unit propagation; no projection needed")
+            else:
+                logger.info(f"XOR RREF sucessful - received {xor_rref_meta}")
 
-            logger.warning("XOR RREF preprocessing unavailable; continuing without XOR projection")
 
     pf = config.invocation.prefix_file if prefix_file is None else prefix_file
     prefixes = sat_parser.process_prefix(pf)
@@ -334,7 +373,7 @@ def create_worker_session(
         tol=optimiser_cfg.tolerance,
     )
 
-    seed = int(time()) if runtime_common.rand_seed else 0
+    seed = int(time()) if runtime_common.rand_seed == -1 else runtime_common.rand_seed
     logger.info(f"seed={seed}, rand_seed={runtime_common.rand_seed}")
     trace(f"seed initialized={seed}")
     key = jax.random.PRNGKey(np.array(seed))
@@ -1151,7 +1190,7 @@ if __name__ == "__main__":
     runtime_common_opts("--progress", action="store_false", field="benchmark", help="Display progress (impl. -e False)")
     runtime_common_opts("-c", "--counting", action="store_true", field="counting", help="#SAT - Enum sols to timeout")
     runtime_common_opts("-s", "--seed", type=int, field="rand_seed", help="Force initialise seed (non-negative int)")
-    runtime_common_opts("--ffseed", type=bool, field="ffsat_seed", action="store_true", help="FFSAT Key increments")
+    runtime_common_opts("--ffseed", field="ffsat_seed", action="store_true", help="FFSAT Key increments")
     runtime_common_opts("-u", "--unsat_thresh", type=float, field="unsat_thresh", help="MAXSAT - #UNSAT stop threshold")
     runtime_common_opts("-m", "--sampler", type=str, field="pt_sampler", choices=SAMPLERS, help="Initial point sampler")
 

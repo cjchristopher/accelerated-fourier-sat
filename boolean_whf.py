@@ -416,13 +416,13 @@ class ClauseProcessor:
                     g_coeffs[i + j] += qj * H[i]
 
             # ## "Slower"?? version just computing the two full cardinalities and combine
-            g_coeffs = [
-                L - U  # -U since <k would normally add a -1 multiplier
-                for (L, U) in zip(
-                    [comb(n - 1, k_l - 1) * coeff for coeff in __int_noisepoly_coeffs(n, n - k_l, k_l - 1)],
-                    [comb(n - 1, k_u - 1) * coeff for coeff in __int_noisepoly_coeffs(n, n - k_u, k_u - 1)],
-                )
-            ]
+            # g_coeffs = [
+            #     L - U  # -U since <k would normally add a -1 multiplier
+            #     for (L, U) in zip(
+            #         [comb(n - 1, k_l - 1) * coeff for coeff in __int_noisepoly_coeffs(n, n - k_l, k_l - 1)],
+            #         [comb(n - 1, k_u - 1) * coeff for coeff in __int_noisepoly_coeffs(n, n - k_u, k_u - 1)],
+            #     )
+            # ]
 
             coeff_denoms = _coeff_denoms(n)
             coeffs = [numer / denom for numer, denom in zip(g_coeffs, coeff_denoms)]
@@ -446,6 +446,8 @@ class ClauseProcessor:
                 return __xor(sig.len)
             case "amo":
                 return __amo(sig.len)
+            case "card_eq":
+                return __card_range(sig.len, sig.card, sig.card)
             case _:
                 raise ValueError(f"Unknown clause type: {sig.type}")
 
