@@ -1,10 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0 OR GPL-2.0-or-later
 from __future__ import annotations
 
+import ctypes
+import functools
 import json
 import logging
 from dataclasses import asdict, dataclass, field
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 LOG_LEVELS = ["DEBUG", "INFO", "WARNING", "ERROR"]
 
@@ -154,46 +158,75 @@ class NoveltyConfig:
             json.dump(asdict(self), f, indent=2)
 
 
+# CUdevice_attribute value from cuda.h; stable across CUDA versions.
+_CU_ATTR_L2_CACHE_SIZE = 38
+
+
+@functools.cache
+def _query_cuda_l2_bytes(ordinal: int) -> int | None:
+    """L2 cache size of CUDA device `ordinal`, read from the driver; None if unavailable.
+
+    Uses the driver API (libcuda ships with every NVIDIA driver), which needs only cuInit: no
+    context is created and no device memory is touched, so it is safe alongside JAX. The
+    ordinal is relative to CUDA_VISIBLE_DEVICES, as JAX's `local_hardware_id` is.
+    """
+    try:
+        cuda = ctypes.CDLL("libcuda.so.1")
+    except OSError:
+        return None
+    device, value = ctypes.c_int(), ctypes.c_int()
+    if cuda.cuInit(0) != 0 or cuda.cuDeviceGet(ctypes.byref(device), ordinal) != 0:
+        return None
+    if cuda.cuDeviceGetAttribute(ctypes.byref(value), _CU_ATTR_L2_CACHE_SIZE, device) != 0:
+        return None
+    return value.value or None
+
+
 def get_gpu_l2_cache_size(device) -> int | None:
     """
-    Query total on-chip cache capacity of a GPU in bytes.
-    Returns None if unable to determine.
+    L2 cache capacity of a GPU in bytes: queried from the CUDA driver, else from the table below.
 
-    Returns a model-based estimate of L1 + L2 (+ L3 if present) cache capacity.
-    Function name is kept for backward compatibility with existing call sites.
+    L2 alone, not L1 + L2. L2 is the one chip-wide cache: every global-memory access passes
+    through it, and the per-SM L1s are filled from it, so they mostly hold copies of L2 lines
+    rather than adding capacity; data read by many SMs is duplicated across them; and L1 is not
+    coherent across kernel launches, so the hand-off between XLA's fused kernels -- the reuse a
+    "working set fits in cache" batch size relies on -- can only hit in L2.
     """
-    # Lookup table by GPU name.
-    # Values target total cache budget (L1 + L2 + L3 where present), in bytes.
-    # For NVIDIA parts listed here, totals are L1+L2 (no dedicated L3 on these models).
-    CACHE_TABLE = {
-        "V100": (16 * 1024 * 1024),  # ~6MB L2 + ~10MB aggregate L1
+    ordinal = getattr(device, "local_hardware_id", None)
+    if device.platform == "gpu" and ordinal is not None:
+        queried = _query_cuda_l2_bytes(ordinal)
+        if queried is not None:
+            logger.info(f"Queried {device.device_kind} L2 from the CUDA driver: {queried / 2**20:.1f} MB")
+            return queried
+
+    # Fallback by GPU name, for when the driver query fails. L2 sizes in bytes.
+    MB = 1024 * 1024
+    L2_TABLE = {
+        "V100": 6 * MB,
         # Ampere
-        "A100": int(60.25 * 1024 * 1024),  # 40MB L2 + 20.25MB aggregate L1
-        "A6000": int(16.5 * 1024 * 1024),  # 6MB L2 + 10.5MB aggregate L1
-        "A5000": (14 * 1024 * 1024),  # 6MB L2 + 8MB aggregate L1
-        "A4000": (10 * 1024 * 1024),  # 4MB L2 + 6MB aggregate L1
-        "RTX 3090": int(16.25 * 1024 * 1024),  # 6MB L2 + 10.25MB aggregate L1
-        "RTX 3080": int(13.5 * 1024 * 1024),  # 5MB L2 + 8.5MB aggregate L1
-        "RTX 3070": int(9.75 * 1024 * 1024),  # 4MB L2 + 5.75MB aggregate L1
+        "A100": 40 * MB,
+        "RTX A2000": 4 * MB,
+        "RTX A4000": 4 * MB,
+        "RTX A5000": 6 * MB,
+        "RTX A6000": 6 * MB,
+        "A4000": 4 * MB,
+        "A5000": 6 * MB,
+        "A6000": 6 * MB,
+        "RTX 3090": 6 * MB,
+        "RTX 3080": 5 * MB,
+        "RTX 3070": 4 * MB,
         # Hopper
-        "H100": (80 * 1024 * 1024),  # 50MB L2 + ~30MB aggregate L1
-        "H200": (83 * 1024 * 1024),  # 50MB L2 + ~33MB aggregate L1
+        "H100": 50 * MB,
+        "H200": 50 * MB,
         # Ada Lovelace
-        "RTX 4090": (88 * 1024 * 1024),  # 72MB L2 + 16MB aggregate L1
-        "RTX 4080": int(73.5 * 1024 * 1024),  # 64MB L2 + 9.5MB aggregate L1
-        "RTX 4070": int(41.75 * 1024 * 1024),  # 36MB L2 + 5.75MB aggregate L1
-        "RTX A2000": int(7.25 * 1024 * 1024),  # 4MB L2 + 3.25MB aggregate L1
-        "RTX A4000": (10 * 1024 * 1024),  # 4MB L2 + 6MB aggregate L1
-        "RTX A5000": (14 * 1024 * 1024),  # 6MB L2 + 8MB aggregate L1
-        "RTX A6000": int(16.5 * 1024 * 1024),  # 6MB L2 + 10.5MB aggregate L1
-        "L40": int(65.75 * 1024 * 1024),  # 48MB L2 + ~17.75MB aggregate L1
-        # Blackwell
-        "B100": (128 * 1024 * 1024),  # Estimated total cache
-        "B200": (160 * 1024 * 1024),  # Estimated total cache
+        "RTX 4090": 72 * MB,
+        "RTX 4080": 64 * MB,
+        "RTX 4070": 36 * MB,
+        "L40": 96 * MB,  # AD102
     }
     gpu_name = device.device_kind
-    for key, size in CACHE_TABLE.items():
+    for key, size in L2_TABLE.items():
         if key in gpu_name:
             return size
-    return 32 * 1024 * 1024  # Conservative default
+    return 32 * MB  # Conservative default
 

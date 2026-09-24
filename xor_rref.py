@@ -8,14 +8,8 @@ from typing import NamedTuple
 import jax.numpy as jnp
 import numpy as np
 from jax import Array
-from numpy.typing import NDArray
 
 from sat_loader import Clauses
-
-try:
-    import galois
-except ImportError:
-    galois = None
 
 logger = logging.getLogger(__name__)
 
@@ -76,9 +70,8 @@ def literals_from_unit_bits(bits: dict[int, int]) -> list[int]:
 def _xor_rows_from_clause_sets(xor_clause_sets: list[Clauses]) -> list[tuple[set[int], int]]:
     """One (variable set, parity) pair per XOR clause.
 
-    Mirrors the matrix builder exactly: a repeated variable cancels (`matrix[row, col] ^= 1`
-    twice), and parity starts at 1 and flips once per negative literal, so the row asserts
-    `XOR_j bit_j = parity`.
+    A repeated variable cancels (`x ^ x = 0`, so an even count drops out), and parity starts
+    at 1 and flips once per negative literal, so the row asserts `XOR_j bit_j = parity`.
     """
     rows: list[tuple[set[int], int]] = []
     for clause_set in xor_clause_sets:
@@ -164,55 +157,67 @@ def _propagate_xor_units(
     return remaining, derived, unsat
 
 
-def _rref_gf2_numpy(matrix: NDArray, parity: NDArray) -> tuple[NDArray, NDArray, bool]:
-    n_rows, n_cols = matrix.shape
-    aug = np.concatenate([matrix, parity[:, None]], axis=1).astype(np.uint8)
+def _rref_gf2_sparse(rows: list[tuple[set[int], int]], n_cols: int) -> tuple[list[tuple[int, list[int], int]], bool]:
+    """Gauss-Jordan elimination over GF(2) on sparse rows.
 
-    pivot_row = 0
+    Each row is a set of column indices, so eliminating one row from another is a symmetric
+    difference costing the pivot row's weight, and a column -> rows occurrence map names
+    exactly the rows to eliminate. Work scales with the non-zeros rather than rows x columns:
+    on SHA-1 r80 (23.8k x 36k, ~16 non-zeros per reduced row) this takes ~1 s, where a dense
+    byte-matrix reduction (`galois.row_reduce`) took ~55 s and ~1.7 GB. Sets rather than
+    packed bitsets because RREF rows here stay far below 1% dense; a system that filled in
+    densely would favour packed words instead.
+
+    Pivot columns are taken in ascending order, so the result is *the* reduced row echelon
+    form, which is unique: identical to any dense reduction of the same matrix. Which row
+    supplies a pivot does not change that result, so the lightest candidate is taken to keep
+    intermediate fill down.
+
+    Returns (pivot column, sorted non-pivot support, rhs) per pivot row in ascending pivot
+    order, and whether the system is inconsistent (a row reduced to `0 = 1`).
+    """
+    supports = [set(cols) for cols, _ in rows]
+    rhs = [parity for _, parity in rows]
+    occurrences: dict[int, set[int]] = {}
+    for idx, cols in enumerate(supports):
+        for col in cols:
+            occurrences.setdefault(col, set()).add(idx)
+
+    pivots: list[tuple[int, int]] = []  # (pivot column, row index)
+    is_pivot_row = [False] * len(supports)
     for col in range(n_cols):
-        if pivot_row >= n_rows:
-            break
-
-        candidates = np.where(aug[pivot_row:, col] == 1)[0]
-        if candidates.size == 0:
+        candidates = [idx for idx in occurrences.get(col, ()) if not is_pivot_row[idx]]
+        if not candidates:
             continue
+        pivot = min(candidates, key=lambda idx: (len(supports[idx]), idx))
+        is_pivot_row[pivot] = True
+        pivots.append((col, pivot))
+        pivot_support = supports[pivot]
+        # Full Gauss-Jordan: clear the column from earlier pivot rows too, not just later ones.
+        for idx in list(occurrences[col]):
+            if idx == pivot:
+                continue
+            support = supports[idx]
+            for var in pivot_support:
+                if var in support:
+                    support.discard(var)
+                    occurrences[var].discard(idx)
+                else:
+                    support.add(var)
+                    occurrences[var].add(idx)
+            rhs[idx] ^= rhs[pivot]
 
-        pivot = int(candidates[0] + pivot_row)
-        if pivot != pivot_row:
-            aug[[pivot_row, pivot]] = aug[[pivot, pivot_row]]
-
-        for rr in range(n_rows):
-            if rr != pivot_row and aug[rr, col] == 1:
-                aug[rr, :] ^= aug[pivot_row, :]
-
-        pivot_row += 1
-
-    coeff = aug[:, :n_cols]
-    rhs = aug[:, n_cols]
-    inconsistent = bool(np.any((np.sum(coeff, axis=1) == 0) & (rhs == 1)))
-    return coeff, rhs, inconsistent
-
-
-def _padded_row_supports(free_part: NDArray, free_idx: NDArray) -> tuple[NDArray, NDArray]:
-    """Convert the dense (n_dep, n_free) 0/1 block into padded (n_dep, K) variable ids + mask."""
-    n_dep = free_part.shape[0]
-    rows, cols = np.nonzero(free_part)
-    counts = np.bincount(rows, minlength=n_dep)
-    width = max(int(counts.max()) if counts.size else 0, 1)
-    offsets = np.concatenate([[0], np.cumsum(counts)[:-1]]) if n_dep else np.zeros(0, dtype=np.int64)
-    positions = np.arange(rows.size) - offsets[rows]
-
-    row_vars = np.zeros((n_dep, width), dtype=np.int32)
-    row_mask = np.zeros((n_dep, width), dtype=bool)
-    row_vars[rows, positions] = free_idx[cols]
-    row_mask[rows, positions] = True
-    return row_vars, row_mask
+    inconsistent = any(rhs[idx] and not supports[idx] for idx in range(len(supports)))
+    reduced = [(col, sorted(supports[idx] - {col}), rhs[idx]) for col, idx in pivots]
+    return reduced, inconsistent
 
 
-def _build_xor_rref_metadata_from_matrix(
-    matrix: NDArray, parity: NDArray, xor_vars: list[int], clause_count: int
+def _build_xor_rref_metadata(
+    rows: list[tuple[set[int], int]], xor_vars: list[int], clause_count: int
 ) -> tuple[XorRREFMetadata | None, dict[int, int], bool]:
     """Reduce the system and read off the dependent/free split.
+
+    `rows` are (column set, parity) pairs over columns indexing the sorted `xor_vars`.
 
     Returns the metadata, any dependents the reduction *forces* outright, and whether the
     system is inconsistent. A forced dependent is a row left with no free support: `x_d = b`.
@@ -222,55 +227,24 @@ def _build_xor_rref_metadata_from_matrix(
     dependent appears in no other row, so hoisting it needs no re-elimination and cannot
     cascade within the system: one pass is exact.
     """
-    n_cols = matrix.shape[1]
-
-    if galois is not None:
-        GF2 = galois.GF(2)
-        augmented = np.concatenate([matrix, parity[:, None]], axis=1)
-        rref = np.array(GF2(augmented).row_reduce(), dtype=np.uint8)
-        coeff = rref[:, :n_cols]
-        rhs = rref[:, n_cols]
-        inconsistent = bool(np.any((np.sum(coeff, axis=1) == 0) & (rhs == 1)))
-    else:
-        coeff, rhs, inconsistent = _rref_gf2_numpy(matrix, parity)
-
+    n_cols = len(xor_vars)
+    reduced, inconsistent = _rref_gf2_sparse(rows, n_cols)
     if inconsistent:
         logger.warning("XOR system is inconsistent after RREF; XOR projection is disabled")
         return None, {}, True
 
-    active_rows = np.where(np.sum(coeff, axis=1) > 0)[0]
     xor_vars_np = np.array(xor_vars, dtype=np.int32)
-
-    if active_rows.size == 0:
-        dep_idx = np.array([], dtype=np.int32)
-        free_idx = xor_vars_np
-        free_part = np.zeros((0, n_cols), dtype=np.uint8)
-        b_final = np.zeros((0,), dtype=np.float32)
-    else:
-        dep_local = np.array([int(np.argmax(coeff[row])) for row in active_rows], dtype=np.int32)
-        free_mask = np.ones(n_cols, dtype=bool)
-        free_mask[dep_local] = False
-        free_local = np.where(free_mask)[0].astype(np.int32)
-
-        dep_idx = xor_vars_np[dep_local]
-        free_idx = xor_vars_np[free_local]
-        free_part = coeff[np.ix_(active_rows, free_local)].astype(np.uint8)
-        b_final = rhs[active_rows].astype(np.float32)
+    pivot_cols = {col for col, _, _ in reduced}
+    free_idx = xor_vars_np[[col for col in range(n_cols) if col not in pivot_cols]]
 
     # Rows the reduction leaves with no free support force their dependent outright.
-    forced: dict[int, int] = {}
-    if dep_idx.size:
-        forced_rows = free_part.sum(axis=1) == 0
-        if forced_rows.any():
-            forced = {
-                int(var): int(bit)
-                for var, bit in zip(dep_idx[forced_rows], b_final[forced_rows].astype(np.int64))
-            }
-            keep = ~forced_rows
-            dep_idx = dep_idx[keep]
-            free_part = free_part[keep]
-            b_final = b_final[keep]
-            logger.info("XOR RREF forced %d dependent variables outright", len(forced))
+    forced = {int(xor_vars_np[col]): int(bit) for col, support, bit in reduced if not support}
+    if forced:
+        reduced = [row for row in reduced if row[1]]
+        logger.info("XOR RREF forced %d dependent variables outright", len(forced))
+
+    dep_idx = xor_vars_np[[col for col, _, _ in reduced]]
+    b_final = np.array([bit for _, _, bit in reduced], dtype=np.float32)
 
     if logger.isEnabledFor(logging.INFO):
         logger.info(
@@ -285,7 +259,14 @@ def _build_xor_rref_metadata_from_matrix(
         if free_idx.size <= 64:
             logger.info("XOR free vars (0-indexed): %s", free_idx.tolist())
 
-    row_vars, row_mask = _padded_row_supports(free_part, free_idx)
+    # Padded (n_dep, K) form, K = max row weight (at least 1 so the arrays are never empty).
+    width = max((len(support) for _, support, _ in reduced), default=0)
+    row_vars = np.zeros((len(reduced), max(width, 1)), dtype=np.int32)
+    row_mask = np.zeros_like(row_vars, dtype=bool)
+    for row, (_, support, _) in enumerate(reduced):
+        row_vars[row, : len(support)] = xor_vars_np[support]
+        row_mask[row, : len(support)] = True
+
     meta = XorRREFMetadata(
         row_vars=jnp.array(row_vars),
         row_mask=jnp.array(row_mask),
@@ -346,15 +327,9 @@ def preprocess_xor_system(
         return XorPreprocessResult(None, derived, False)
 
     var_to_col = {var_idx: col_idx for col_idx, var_idx in enumerate(xor_vars)}
-    n_cols = len(xor_vars)
-    matrix = np.zeros((n_rows, n_cols), dtype=np.uint8)
-    parity = np.zeros(n_rows, dtype=np.uint8)
-    for row, (variables, row_parity) in enumerate(remaining):
-        for var_idx in variables:
-            matrix[row, var_to_col[var_idx]] ^= 1
-        parity[row] = row_parity
+    rows = [({var_to_col[var_idx] for var_idx in variables}, parity) for variables, parity in remaining]
 
-    meta, forced, unsat = _build_xor_rref_metadata_from_matrix(matrix, parity, xor_vars, n_rows)
+    meta, forced, unsat = _build_xor_rref_metadata(rows, xor_vars, n_rows)
     if unsat or meta is None:
         return XorPreprocessResult(None, derived, True)
     # Tier 2. Forced pivots appear in no other row, so hoisting them cannot cascade within the

@@ -496,7 +496,7 @@ def run_beam_search(
         l2_cache_size = get_gpu_l2_cache_size(devices[0])
         if l2_cache_size is not None:
             gpu_mem_target = int(l2_cache_size * 0.90) * n_devices * 2
-            logger.info(f"Targeting total cache: {l2_cache_size / (1024 * 1024):.1f} MB per GPU")
+            logger.info(f"Targeting L2 cache: {l2_cache_size / (1024 * 1024):.1f} MB per GPU")
         else:
             gpu_mem_target = devices[0].memory_stats()["bytes_limit"] * 0.01
             logger.info("Cache size unknown, using 1% VRAM heuristic")
