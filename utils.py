@@ -71,6 +71,7 @@ class RuntimeAFSATConfig:
     xor_rref: bool = True
     propagate: bool = True  # full-formula unit propagation before the JAX stage
     drop_xor_eval: bool = True  # skip the XOR objective when the RREF projector satisfies it by construction
+    eo_simplex: bool = False  # exactly-one groups as simplices (eo_simplex.py); pgd only, not with -u
 
 
 @dataclass

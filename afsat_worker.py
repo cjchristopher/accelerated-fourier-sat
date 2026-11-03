@@ -303,6 +303,10 @@ def main() -> None:
         help="Accepted for compatibility: the worker always compiles before reporting READY",
     )
     runtime_afsat_opts("--xor_rref", action="store_true", field="xor_rref", help="Enable XOR RREF projection")
+    runtime_afsat_opts(
+        "--eo_simplex", action="store_true", field="eo_simplex",
+        help="Exactly-one groups as simplices (pgd only; ignored with -u or with XOR RREF projection)",
+    )
 
     optimiser_opts = make_option_group("Optimiser Aliases", "optimiser")
     optimiser_opts("-i", "--iters_desc", type=int, field="max_iters", help="Max iterations")

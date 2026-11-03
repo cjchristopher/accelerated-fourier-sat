@@ -77,6 +77,7 @@ from sparklines import sparklines
 from tqdm.auto import tqdm
 
 from boolean_whf import Objective
+from eo_simplex import EOSimplex, build_eo_simplex
 from samplers import SAMPLERS, sample_assignments
 from sat_loader import PBSATFormula, UnsatError
 from solvers import Optimiser, build_eval_verify, drop_projected_xor_evaluators, seq_eval_verify
@@ -224,13 +225,15 @@ def make_batch_programs(
     weight_decay: float,
     weights: tuple[Array, ...],
     batch_sharding: NamedSharding,
+    start_projection: Callable[[Array, Array], Array] | None = None,
 ) -> tuple[Callable, Callable, Callable]:
     """The main loop's per-batch work around the descent, as compiled programs: (draw, summarise, reweight).
 
     draw(state, prefixes) -> (state, x0, fixed, positives): the next batch's starting points, sharded over the batch
         like the kernel's inputs, and the sampler state for the batch after. --ffseed seeds batch k with PRNGKey(k), as
         FastFourierSAT does; otherwise a split chain. jax's partitionable threefry gives the same points whatever
-        the sharding.
+        the sharding. `start_projection(x, fixed)`, if given, maps each sample into the search's domain (EO
+        simplices).
     summarise(x_opt, unsat, unsat_ct, penalty) -> (count, index, x, unsatisfied clauses, penalty): the batch's best
         point, and the reweighting penalty with this batch's unsatisfied counts per clause added. Reductions over the
         sharded batch axis become cross-device reductions; the outputs are replicated, so every device (and, with
@@ -250,6 +253,8 @@ def make_batch_programs(
         else:
             state, s_key = jax.random.split(state)
         x0, fixed = sample_assignments(s_key, batch, n_vars, sample_method, prefixes)
+        if start_projection is not None:
+            x0 = jax.vmap(start_projection)(x0, fixed)
         return state, x0, fixed, jnp.sum(x0 > 0, axis=1)
 
     def _summarise(x_opt, unsat, unsat_ct, penalty):
@@ -275,22 +280,28 @@ def make_batch_programs(
 
 def build_solver(
     config: AFSATConfig,
+    host_objs: tuple[Objective, ...],
     objs: tuple[Objective, ...],
+    n_vars: int,
     xor_rref_meta: XorRREFMetadata | None,
     prefix_vectors: Array | None,
     *,
     keep_xor_eval: bool = False,
     folded_xor: bool = False,
-) -> Optimiser:
+) -> tuple[Optimiser, EOSimplex | None]:
     """The objective and the batch solver, shared by the CLI loop and the Dagster worker.
 
-    objs are the objectives, placed on the mesh. Applies the XOR-evaluator drop under RREF projection (unless
-    keep_xor_eval).
+    host_objs are the parsed objectives (host arrays, used to choose EO groups); objs the same, placed on the mesh.
+    Applies the XOR-evaluator drop under RREF projection (unless keep_xor_eval) and, with --eo_simplex, the EO simplex
+    reparameterisation: the evaluator skips the clauses the simplex or the exact OR term handle (a weight mask, so
+    reweighting can never revive them there), the OR term is added to the objective, and the solver projects onto the
+    simplices and verifies the decoded vertex. Returns the solver and the EOSimplex in use (None if off or not
+    applicable).
 
     folded_xor (Dagster worker): the projection reads per-prefix folded RREF rows from the kernel's extra argument
     (xor_rref.fold_prefix / pack_rows). The fold keeps every XOR clause satisfied by construction whatever the prefix
     fixes, so the XOR evaluator is always dropped."""
-    runtime_afsat, optimiser_cfg = config.runtime_afsat, config.optimiser
+    runtime_common, runtime_afsat, optimiser_cfg = config.runtime_common, config.runtime_afsat, config.optimiser
     optimiser = optimiser_cfg.name
     obj_eval_fns, obj_verify_fns = build_eval_verify(objs, optimiser == "unbounded")
     if runtime_afsat.drop_xor_eval and xor_rref_meta is not None and optimiser != "unbounded" and not keep_xor_eval:
@@ -309,10 +320,43 @@ def build_solver(
     seq_evaluator, seq_verifier = seq_eval_verify(
         obj_eval_fns, obj_verify_fns, xor_rref_meta=xor_rref_meta, folded_xor=folded_xor
     )
-    return Optimiser(
+
+    eo = None
+    if runtime_afsat.eo_simplex:
+        if optimiser != "pgd":
+            logger.warning(f"--eo_simplex needs the pgd optimiser (not {optimiser}); ignored")
+        elif runtime_common.unsat_thresh:
+            logger.warning("--eo_simplex enforces exactly-one constraints as hard, but -u lets a solution leave "
+                           "any clause unsatisfied; ignored")
+        elif xor_rref_meta is not None:
+            logger.warning("--eo_simplex with an active XOR RREF projection is not supported (the projector "
+                           "overwrites dependent variables); ignored")
+        else:
+            eo = build_eo_simplex(host_objs, n_vars)
+            if eo is None:
+                logger.warning("--eo_simplex: no exactly-one group can be used as a simplex; ignored")
+            else:
+                logger.info(f"EO simplex: {eo.n_groups} groups covering {eo.covered}/{n_vars} variables; "
+                            f"{eo.n_or} OR clauses evaluated exactly")
+
+    if eo is not None:
+        masks = tuple(jnp.asarray(m) for m in eo.eval_masks)
+        boolean_evaluator, or_term = seq_evaluator, eo.or_term
+
+        def seq_evaluator(x, fixed_vars, weights, **kw):
+            value, aux = boolean_evaluator(x, fixed_vars, tuple(w * m for w, m in zip(weights, masks)), **kw)
+            if or_term is not None:
+                x_pinned = jnp.where(fixed_vars, jax.lax.stop_gradient(x), x)  # as seq_eval_verify does
+                value = value + or_term(x_pinned, weights)
+            return value, aux
+
+    solver = Optimiser(
         seq_evaluator, seq_verifier, algorithm=optimiser, maxiter=optimiser_cfg.max_iters,
         tol=optimiser_cfg.tolerance,
+        projection=None if eo is None else eo.project,
+        decode=None if eo is None else eo.decode,
     )
+    return solver, eo
 
 
 def pin_warmup_inputs(x: Array, prefix_vectors: Array | None) -> tuple[Array, Array]:
@@ -358,10 +402,12 @@ class AFSATWorkerSession:
 
     prepared: AFSATProblem
     config: AFSATConfig
+    host_objs: tuple[Objective, ...]
     objs: tuple[Objective, ...]
     weights: tuple[Array, ...]
     batch: int
     solvers: dict[bool, Optimiser]
+    eo: EOSimplex | None
     dep_idx: NDArray | None
     fold_rows: list[XorRow] | None
     fold_layout: FoldLayout | None
@@ -551,7 +597,9 @@ def create_worker_session(
         xor_rows = (jax.device_put(pack_rows(fold_layout, fold_rows), replicated),)  # the unfolded rows always fit
         logger.info(f"Per-prefix RREF folding: {len(fold_rows)} rows in buckets of width {fold_layout.widths}, "
                     f"capacities {fold_layout.capacities}")
-    solver = build_solver(config, sharded_objs, xor_rref_meta, None, folded_xor=fold_layout is not None)
+    solver, eo = build_solver(
+        config, prepared.objectives, sharded_objs, n_vars, xor_rref_meta, None, folded_xor=fold_layout is not None
+    )
 
     seed = int(time()) if runtime_common.rand_seed == -1 else runtime_common.rand_seed
     logger.info(f"seed={seed}, rand_seed={runtime_common.rand_seed}")
@@ -596,6 +644,7 @@ def create_worker_session(
     # warm-up does: requests then compile nothing (a worker answers many requests, so this is never skipped).
     draw, summarise, _ = make_batch_programs(
         batch, n_vars, runtime_common.pt_sampler, False, False, runtime_common.weight_decay, weights, batch_sharding,
+        start_projection=None if eo is None else eo.project,
     )
     sampler_state = jax.device_put(key, replicated)
     penalty = jax.device_put(jnp.zeros((sum(int(w.shape[0]) for w in weights),), dtype=jnp.int64), replicated)
@@ -619,10 +668,12 @@ def create_worker_session(
     return AFSATWorkerSession(
         prepared=prepared,
         config=config,
+        host_objs=prepared.objectives,
         objs=sharded_objs,
         weights=weights,
         batch=batch,
         solvers={False: solver},
+        eo=eo,
         dep_idx=dep_idx,
         fold_rows=fold_rows,
         fold_layout=fold_layout,
@@ -670,7 +721,10 @@ def _worker_request(session: AFSATWorkerSession, prefix_vectors: Array) -> tuple
         keep = session.dep_idx is not None and bool(np.any(np.asarray(prefix_vectors)[:, session.dep_idx] != 0))
     if keep not in session.solvers:
         logger.info("Prefix fixes an RREF dependent variable: compiling the kernel that keeps the XOR evaluator")
-        solver = build_solver(session.config, session.objs, session.prepared.xor_rref_meta, None, keep_xor_eval=True)
+        solver, _ = build_solver(
+            session.config, session.host_objs, session.objs, session.prepared.n_var, session.prepared.xor_rref_meta,
+            None, keep_xor_eval=True,
+        )
         solver.compile(session.x_spec, session.fixed_spec, session.weights)
         session.solvers[keep] = solver
     return session.solvers[keep], (), prefix_vectors
@@ -709,8 +763,10 @@ def run_worker_single_batch(session: AFSATWorkerSession, prefix_vectors: Array |
             fuzz_attempt += 1
             fuzz_adj = jnp.sign(fuzz) * jnp.abs(fuzz) ** (1 / fuzz_mag) if fuzz_mag != 1 else fuzz
 
-            # Back onto the hypercube; a new array, so donating it leaves opt_x intact.
+            # Back onto the hypercube (or the EO simplices); a new array, so donating it leaves opt_x intact.
             F_x = jnp.clip(jnp.where(fuzz_mask, F_x + fuzz_adj, F_x), -1, 1)
+            if session.eo is not None:
+                F_x = jax.vmap(session.eo.project)(F_x, fixed_vars)
             F_x_sign = jnp.sign(F_x)  # F_x is donated to the solver below
 
             F_opt_x, F_opt_unsat, F_opt_iters, F_opt_unsat_ct, _ = solver.run(F_x, fixed_vars, weights, *extra)
@@ -805,12 +861,13 @@ def run_solver(
     jax.sharding.set_mesh(mesh)
 
     # Construct weights, and shard both weights and objectives.
+    host_objs = objs
     objs = shard_tree(objs, obj_sharding)
     weights = tuple(jnp.full((obj.clauses.lits.shape[0],), 1.0, dtype=float) for obj in objs)
     weights = shard_tree(weights, obj_sharding)
 
     # Construct pure JAX functions (closures) and build solver.
-    solver = build_solver(config, objs, xor_rref_meta, prefix_vectors)
+    solver, eo = build_solver(config, host_objs, objs, n_vars, xor_rref_meta, prefix_vectors)
 
     seed = int(time()) if rand_seed == -1 else rand_seed
     logger.info(f"seed={seed}, rand_seed={rand_seed}")
@@ -845,7 +902,8 @@ def run_solver(
     stats = output_cfg.stats or not benchmark
     reweight = bool(restart_thresh)
     draw, summarise, reweight_weights = make_batch_programs(
-        batch, n_vars, sample_method, ffsat_seed, reweight, weight_decay, weights, batch_sharding
+        batch, n_vars, sample_method, ffsat_seed, reweight, weight_decay, weights, batch_sharding,
+        start_projection=None if eo is None else eo.project,
     )
     # Placed as the programs return them (replicated), so the first call and every later one share one argument type.
     replicated = NamedSharding(mesh, jax.P())
@@ -999,8 +1057,10 @@ def run_solver(
                 else:
                     fuzz_adj = fuzz
 
-                # Project back on to hypercube.
+                # Project back on to hypercube (or the EO simplices).
                 F_x = jnp.clip(jnp.where(fuzz_mask, F_x + fuzz_adj, F_x), -1, 1)
+                if eo is not None:
+                    F_x = jax.vmap(eo.project)(F_x, fixed_vars)
                 F_x_sign = jnp.sign(F_x)  # F_x is donated to the solver below
 
                 F_opt_x, F_opt_unsat, F_opt_iters, F_opt_unsat_ct, (_, F_eval_scores) = solver.run(
@@ -1332,6 +1392,10 @@ if __name__ == "__main__":
     )
     runtime_afsat_opts(
         "--keep_xor_eval", action="store_false", field="drop_xor_eval", help="Keep the XOR objective under RREF"
+    )
+    runtime_afsat_opts(
+        "--eo_simplex", action="store_true", field="eo_simplex",
+        help="Exactly-one groups as simplices (pgd only; ignored with -u or with XOR RREF projection)",
     )
 
     optimiser_opts = make_option_group("Optimiser Aliases", "optimiser")
