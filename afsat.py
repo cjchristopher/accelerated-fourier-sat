@@ -7,14 +7,13 @@ import math
 import os
 import shutil
 import sys
-import threading
 from argparse import SUPPRESS
 from collections import Counter, defaultdict
 from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import dataclass
 from time import perf_counter as time
-from typing import TypeAlias, overload
+from typing import Any, TypeAlias, overload
 
 from jsonargparse import ArgumentParser as ArgParse
 
@@ -72,6 +71,7 @@ jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
 # import jax_array_info as jai
 import numpy as np
 from jax import Array
+from numpy.typing import NDArray
 from jax.sharding import Mesh, NamedSharding
 from sparklines import sparklines
 from tqdm.auto import tqdm
@@ -87,9 +87,15 @@ from utils import (
 from propagation import propagate_units
 from var_mapper import VarMapper
 from xor_rref import (
+    FoldLayout,
+    XorRow,
     XorRREFMetadata,
+    fold_prefix,
     literals_from_unit_bits,
+    make_fold_layout,
+    pack_rows,
     preprocess_xor_system,
+    rref_rows,
     unit_bits_from_literals,
 )
 
@@ -267,6 +273,48 @@ def make_batch_programs(
     return draw, summarise, reweight_weights
 
 
+def build_solver(
+    config: AFSATConfig,
+    objs: tuple[Objective, ...],
+    xor_rref_meta: XorRREFMetadata | None,
+    prefix_vectors: Array | None,
+    *,
+    keep_xor_eval: bool = False,
+    folded_xor: bool = False,
+) -> Optimiser:
+    """The objective and the batch solver, shared by the CLI loop and the Dagster worker.
+
+    objs are the objectives, placed on the mesh. Applies the XOR-evaluator drop under RREF projection (unless
+    keep_xor_eval).
+
+    folded_xor (Dagster worker): the projection reads per-prefix folded RREF rows from the kernel's extra argument
+    (xor_rref.fold_prefix / pack_rows). The fold keeps every XOR clause satisfied by construction whatever the prefix
+    fixes, so the XOR evaluator is always dropped."""
+    runtime_afsat, optimiser_cfg = config.runtime_afsat, config.optimiser
+    optimiser = optimiser_cfg.name
+    obj_eval_fns, obj_verify_fns = build_eval_verify(objs, optimiser == "unbounded")
+    if runtime_afsat.drop_xor_eval and xor_rref_meta is not None and optimiser != "unbounded" and not keep_xor_eval:
+        # The projector satisfies every XOR clause by construction -- unless a prefix fixes an
+        # RREF dependent, in which case that row is only enforced by the objective, so keep it.
+        # (A folded RREF has no fixed dependents: the fold re-pivots their rows.)
+        dep_idx = np.asarray(xor_rref_meta.dependent_indices)
+        fixed_dep = 0 if prefix_vectors is None or folded_xor else int(
+            np.any(np.asarray(prefix_vectors)[:, dep_idx] != 0, axis=0).sum()
+        )
+        if fixed_dep:
+            logger.info(f"Keeping XOR objective: prefixes fix {fixed_dep} RREF dependent variables")
+        else:
+            obj_eval_fns, n_dropped = drop_projected_xor_evaluators(objs, obj_eval_fns)
+            logger.info(f"XOR objective handled by RREF projection; dropped {n_dropped} evaluator(s)")
+    seq_evaluator, seq_verifier = seq_eval_verify(
+        obj_eval_fns, obj_verify_fns, xor_rref_meta=xor_rref_meta, folded_xor=folded_xor
+    )
+    return Optimiser(
+        seq_evaluator, seq_verifier, algorithm=optimiser, maxiter=optimiser_cfg.max_iters,
+        tol=optimiser_cfg.tolerance,
+    )
+
+
 def pin_warmup_inputs(x: Array, prefix_vectors: Array | None) -> tuple[Array, Array]:
     """Apply the run's prefixes to warmup data, exactly as sample_assignments does for real batches.
 
@@ -297,22 +345,41 @@ class AFSATProblem:
 
 @dataclass
 class AFSATWorkerSession:
+    """A persistent worker's search (afsat_worker.py), built and compiled once by create_worker_session; each request
+    then runs one batch for its prefix (run_worker_single_batch).
+
+    Under the RREF projection (pgd / lbfgsb), each request's prefix is folded into the RREF on the host
+    (xor_rref.fold_prefix): fixed dependents hand their rows to free variables, dependents the prefix determines join
+    the prefix, and a contradicting prefix is refuted without a descent. The folded rows go to the kernel as an
+    argument in a fixed slot layout (fold_layout), so a new prefix costs a device_put, not a recompile, and the XOR
+    evaluator stays dropped. If the folded rows overflow the layout (fill-in), the request falls back to a kernel
+    with the unfolded RREF built in that keeps the XOR evaluator (solvers[True], compiled on first need), as it does
+    for any RREF instance with another optimiser (dep_idx: when a prefix fixes a dependent)."""
+
     prepared: AFSATProblem
-    solver: Optimiser
+    config: AFSATConfig
     objs: tuple[Objective, ...]
     weights: tuple[Array, ...]
-    batch_sharding: NamedSharding
     batch: int
-    sample_method: str
-    counting: bool
-    fuzz_limit: int
-    unsat_h: int
-    optimiser: str
-    binary_v: bool
-    key: Array
+    solvers: dict[bool, Optimiser]
+    dep_idx: NDArray | None
+    fold_rows: list[XorRow] | None
+    fold_layout: FoldLayout | None
+    replicated: NamedSharding
+    draw: Callable
+    summarise: Callable
+    sampler_state: Array
+    penalty: Array
     f_key: Array
+    unit_vector: Array
+    x_spec: Any
+    fixed_spec: Any
+    unsat_h: int
+    fuzz_limit: int
+    counting: bool
+    stats: bool
+    binary_v: bool
     warmup_done: bool
-    warmup_found_solution: bool
 
 
 @dataclass
@@ -396,7 +463,7 @@ def prepare_problem(
             if not maxsatish_mode:
                 print("s UNSATISFIABLE")
                 raise UnsatError("XOR subsystem is inconsistent under preprocessing")
-            logger.warning("MaxSAT mode: continuing without XOR projection despite the inconsistent XOR system")
+            logger.warning("XOR preprocessing found a conflict; continuing without XOR projection")
         else:
             if xor_result.derived:
                 # Propagation implied further literals. They must reach fixed_vars/x0, and
@@ -445,6 +512,8 @@ def create_worker_session(
             return
         trace_hook(message)
 
+    """Build the worker's search once: mesh, objectives, solver and the per-batch programs (make_batch_programs), all
+    compiled ahead of time before the worker reports ready, whatever -w says, so no request pays for compilation."""
     trace("enter")
     runtime_common = config.runtime_common
     runtime_afsat = config.runtime_afsat
@@ -452,36 +521,37 @@ def create_worker_session(
     output_cfg = config.output_logging
 
     n_vars = prepared.n_var
-    objs = prepared.objectives
     xor_rref_meta = prepared.xor_rref_meta
     n_devices = runtime_common.n_devices
-    trace(f"config n_devices={n_devices} prefix_count={prefix_count} warmup={int(runtime_afsat.warmup)}")
+    trace(f"config n_devices={n_devices} prefix_count={prefix_count}")
     devices = jax.devices("gpu")[:n_devices]
     trace(f"resolved devices={len(devices)}")
     if not devices:
         raise RuntimeError("No GPU devices were selected")
 
     trace("building mesh")
-    _, obj_sharding, batch_sharding = get_mesh(devices)
+    mesh, obj_sharding, batch_sharding = get_mesh(devices)
+    jax.sharding.set_mesh(mesh)
 
     trace("sharding objectives")
-    sharded_objs = shard_tree(objs, obj_sharding)
+    sharded_objs = shard_tree(prepared.objectives, obj_sharding)
     trace("allocating objective weights")
     weights = tuple(jnp.full((obj.clauses.lits.shape[0],), 1.0, dtype=float) for obj in sharded_objs)
     weights = shard_tree(weights, obj_sharding)
 
-    trace("building evaluators")
-    obj_eval_fns, obj_verify_fns = build_eval_verify(sharded_objs, optimiser_cfg.name == "unbounded")
-    trace("building sequential evaluator")
-    seq_evaluator, seq_verifier = seq_eval_verify(obj_eval_fns, obj_verify_fns, xor_rref_meta=xor_rref_meta)
-    trace("constructing optimiser")
-    solver = Optimiser(
-        seq_evaluator,
-        seq_verifier,
-        algorithm=optimiser_cfg.name,
-        maxiter=optimiser_cfg.max_iters,
-        tol=optimiser_cfg.tolerance,
-    )
+    trace("building solver")
+    replicated = NamedSharding(mesh, jax.P())
+    xor_dropped = runtime_afsat.drop_xor_eval and xor_rref_meta is not None and optimiser_cfg.name != "unbounded"
+    dep_idx = np.asarray(xor_rref_meta.dependent_indices) if xor_dropped and xor_rref_meta is not None else None
+    fold_rows = fold_layout = None
+    xor_rows: tuple = ()
+    if xor_dropped and xor_rref_meta is not None and optimiser_cfg.name in ("pgd", "lbfgsb"):
+        fold_rows = rref_rows(xor_rref_meta)
+        fold_layout = make_fold_layout(fold_rows, n_vars)
+        xor_rows = (jax.device_put(pack_rows(fold_layout, fold_rows), replicated),)  # the unfolded rows always fit
+        logger.info(f"Per-prefix RREF folding: {len(fold_rows)} rows in buckets of width {fold_layout.widths}, "
+                    f"capacities {fold_layout.capacities}")
+    solver = build_solver(config, sharded_objs, xor_rref_meta, None, folded_xor=fold_layout is not None)
 
     seed = int(time()) if runtime_common.rand_seed == -1 else runtime_common.rand_seed
     logger.info(f"seed={seed}, rand_seed={runtime_common.rand_seed}")
@@ -490,7 +560,7 @@ def create_worker_session(
     f_key = jax.random.PRNGKey(np.array(seed + 1))
 
     # Every worker request goes through process_prefix_line, which always yields a (n_vars,)
-    # vector with the unit prefix merged in; warm up on exactly that (zeros if there are no units).
+    # vector with the unit prefix merged in; compile for exactly that (zeros if there are no units).
     unit_vector = jnp.asarray(prepared.sat_parser.process_prefix_line([]))[None, :]
 
     batch = runtime_afsat.batch_per_device
@@ -521,168 +591,178 @@ def create_worker_session(
     trace("adjusting final batch")
     batch = adjust_batch(devices, batch, mem_cap, prefix_count)
     trace(f"adjusted batch={batch}")
-    warmup_found_solution = False
 
-    if runtime_afsat.warmup:
-        trace("warmup enabled")
-        if guess_batch != batch:
-            trace("rematerializing warmup arrays for adjusted batch")
-            x_guess, empty_prefix = pin_warmup_inputs(
-                jax.random.uniform(f_key, minval=0.99 - (5e-2), maxval=0.99, shape=(batch, n_vars)),
-                unit_vector,
-            )
-            x_guess = jax.device_put(x_guess, batch_sharding)
-            empty_prefix = jax.device_put(empty_prefix, batch_sharding)
-        trace("estimating warmup peak memory")
-        peak_mem = int(solver.peak_memory_estimation(x_guess, empty_prefix, weights))
-        mem_limit = (devices[0].memory_stats() or {}).get("bytes_limit") or 1
-        logger.info(
-            f"Warmup: shape - {x_guess.shape[0]}, peak memory p.d. - {peak_mem}, "
-            + f"peak/point - {peak_mem // (batch // n_devices)}, frac of device memory - {peak_mem / mem_limit:.4f}"
-        )
-        trace("starting warmup")
-        warmup_stop = threading.Event()
+    # The per-batch programs, compiled ahead of time from each other's output shapes and shardings, as run_solver's
+    # warm-up does: requests then compile nothing (a worker answers many requests, so this is never skipped).
+    draw, summarise, _ = make_batch_programs(
+        batch, n_vars, runtime_common.pt_sampler, False, False, runtime_common.weight_decay, weights, batch_sharding,
+    )
+    sampler_state = jax.device_put(key, replicated)
+    penalty = jax.device_put(jnp.zeros((sum(int(w.shape[0]) for w in weights),), dtype=jnp.int64), replicated)
+    trace("compiling")
+    compile_start = time()
+    _, x_spec, fixed_spec, _ = draw.lower(sampler_state, unit_vector).compile().out_info
+    kernel = solver.compile(x_spec, fixed_spec, weights, *xor_rows)
+    out = kernel.out_info  # x_opt, unsat, iters, unsat_ct, aux
+    summarise.lower(out[0], out[1], out[3], penalty).compile()
+    peak_mem = solver.peak_bytes(kernel)
+    mem_limit = (devices[0].memory_stats() or {}).get("bytes_limit") or 1
+    logger.info(
+        f"Compiled in {time() - compile_start:.2f} s: batch {x_spec.shape[0]}, peak memory p.d. {peak_mem}, "
+        f"peak/point {peak_mem // max(batch // n_devices, 1)}, frac of device memory {peak_mem / mem_limit:.4f}"
+    )
+    trace(f"compiled elapsed={time() - compile_start:.3f}s")
 
-        def warmup_heartbeat() -> None:
-            elapsed = 0
-            while not warmup_stop.wait(15):
-                elapsed += 15
-                trace(f"warmup in progress elapsed={elapsed}s")
-
-        warmup_thread = threading.Thread(target=warmup_heartbeat, name="afsat-warmup-heartbeat", daemon=True)
-        warmup_thread.start()
-        warmup_start = time()
-        try:
-            solver.warmup((x_guess, empty_prefix, weights), bool(runtime_common.counting))
-        finally:
-            warmup_stop.set()
-            warmup_thread.join(timeout=1.0)
-        trace(f"warmup complete elapsed={time() - warmup_start:.3f}s")
-        warmup_found_solution = bool((not runtime_common.counting) and solver.warmup_sol)
+    unsat_h = int(runtime_common.unsat_thresh * 2 * n_vars) if runtime_common.unsat_thresh else 0
 
     trace("returning worker session")
     return AFSATWorkerSession(
         prepared=prepared,
-        solver=solver,
+        config=config,
         objs=sharded_objs,
         weights=weights,
-        batch_sharding=batch_sharding,
         batch=batch,
-        sample_method=runtime_common.pt_sampler,
-        counting=bool(runtime_common.counting),
-        fuzz_limit=runtime_afsat.fuzz,
-        unsat_h=int(runtime_common.unsat_thresh * 2 * n_vars) if runtime_common.unsat_thresh else 0,
-        optimiser=optimiser_cfg.name,
-        binary_v=output_cfg.binary_v,
-        key=key,
+        solvers={False: solver},
+        dep_idx=dep_idx,
+        fold_rows=fold_rows,
+        fold_layout=fold_layout,
+        replicated=replicated,
+        draw=draw,
+        summarise=summarise,
+        sampler_state=sampler_state,
+        penalty=penalty,
         f_key=f_key,
-        warmup_done=runtime_afsat.warmup,
-        warmup_found_solution=warmup_found_solution,
+        unit_vector=unit_vector,
+        x_spec=x_spec,
+        fixed_spec=fixed_spec,
+        unsat_h=unsat_h,
+        fuzz_limit=runtime_afsat.fuzz,
+        counting=bool(runtime_common.counting),
+        stats=output_cfg.stats,
+        binary_v=output_cfg.binary_v,
+        warmup_done=True,
     )
 
 
+def _worker_request(session: AFSATWorkerSession, prefix_vectors: Array) -> tuple[Optimiser, tuple, Array]:
+    """The solver, its extra kernel arguments and the prefix for one request (AFSATWorkerSession).
+
+    With per-prefix folding: fold the prefix into the RREF, add the dependents it determines to the prefix, and pass
+    the folded rows; a prefix the fold refutes raises UnsatError (the worker logs it and runs no descent). Otherwise,
+    or if the folded rows overflow the layout: the kernel that keeps the XOR evaluator when the prefix fixes an RREF
+    dependent, built and compiled the first time a prefix needs it."""
+    if session.fold_layout is not None and session.fold_rows is not None:
+        prefix = np.asarray(prefix_vectors)[0]
+        folded = fold_prefix(session.fold_rows, prefix)
+        if folded is None:
+            raise UnsatError("cube contradicts the XOR system (refuted by the RREF fold)")
+        if folded.forced:
+            prefix = prefix.copy()
+            for var, bit in folded.forced.items():
+                prefix[var] = -1 if bit else 1  # -1 is TRUE
+            prefix_vectors = jnp.asarray(prefix)[None, :]
+        packed = pack_rows(session.fold_layout, folded.rows)
+        if packed is not None:
+            return session.solvers[False], (jax.device_put(packed, session.replicated),), prefix_vectors
+        logger.warning("Folded RREF rows overflow the slot layout; this request keeps the XOR evaluator instead")
+        keep = True
+    else:
+        keep = session.dep_idx is not None and bool(np.any(np.asarray(prefix_vectors)[:, session.dep_idx] != 0))
+    if keep not in session.solvers:
+        logger.info("Prefix fixes an RREF dependent variable: compiling the kernel that keeps the XOR evaluator")
+        solver = build_solver(session.config, session.objs, session.prepared.xor_rref_meta, None, keep_xor_eval=True)
+        solver.compile(session.x_spec, session.fixed_spec, session.weights)
+        session.solvers[keep] = solver
+    return session.solvers[keep], (), prefix_vectors
+
+
 def run_worker_single_batch(session: AFSATWorkerSession, prefix_vectors: Array | None = None) -> AFSATBatchResult:
-    n_clause = session.prepared.n_clause
-    n_vars = session.prepared.n_var
-
+    """One batch for one prefix, on the compiled programs of create_worker_session: draw the starting points (prefix
+    applied), descend, and summarise on the device; the best point's count comes back, and with --stats the
+    per-descent statistics as well. Fuzzing, if enabled, is as in run_solver."""
     start_batch = time()
+    if prefix_vectors is None:
+        prefix_vectors = session.unit_vector
+    solver, extra, prefix_vectors = _worker_request(session, prefix_vectors)
+    weights, summarise = session.weights, session.summarise
 
-    session.key, s_key = jax.random.split(session.key)
-    session.f_key, s_f_key = jax.random.split(session.f_key)
-    x0, fixed_vars = sample_assignments(s_key, session.batch, n_vars, session.sample_method, prefix_vectors)
-    x0_dev = jax.device_put(x0.copy(), session.batch_sharding)
-    fixed_vars = jax.device_put(fixed_vars, session.batch_sharding)
+    session.sampler_state, x0, fixed_vars, x0_positive = session.draw(session.sampler_state, prefix_vectors)
+    opt_x, opt_unsat, opt_iters, opt_unsat_ct, aux_info = solver.run(x0, fixed_vars, weights, *extra)  # x0 donated
+    b_unsat, _, best_x_dev, best_row_dev, _ = summarise(opt_x, opt_unsat, opt_unsat_ct, session.penalty)
+    best_unsat = int(jax.device_get(b_unsat))
 
-    opt_x0, opt_unsat, opt_iters, opt_unsat_ct, aux_info = session.solver.run(x0_dev, fixed_vars, session.weights)
+    threshold_hit = bool(session.unsat_h and best_unsat <= session.unsat_h)
+    found_sol = threshold_hit or best_unsat == 0
 
-    if logger.isEnabledFor(logging.WARNING):
+    if session.fuzz_limit and (session.counting or not found_sol):
+        fuzz_attempt = 0
+        F_x = opt_x
+        session.f_key, s_f_key = jax.random.split(session.f_key)
+        fuzz = jax.random.uniform(s_f_key, minval=1e-7, maxval=1e-2, shape=opt_x.shape)
+        fuzz_mag = 1
+        while fuzz_attempt < session.fuzz_limit:
+            fuzz_mask = np.ones(F_x.shape, dtype=bool)
+            if found_sol:
+                sol_locs = np.flatnonzero(np.asarray(opt_unsat_ct) < 1)
+                fuzz_mask[sol_locs, :] = False  # do not fuzz the solutions
+
+            fuzz_attempt += 1
+            fuzz_adj = jnp.sign(fuzz) * jnp.abs(fuzz) ** (1 / fuzz_mag) if fuzz_mag != 1 else fuzz
+
+            # Back onto the hypercube; a new array, so donating it leaves opt_x intact.
+            F_x = jnp.clip(jnp.where(fuzz_mask, F_x + fuzz_adj, F_x), -1, 1)
+            F_x_sign = jnp.sign(F_x)  # F_x is donated to the solver below
+
+            F_opt_x, F_opt_unsat, F_opt_iters, F_opt_unsat_ct, _ = solver.run(F_x, fixed_vars, weights, *extra)
+            F_unsat, _, F_x_best, F_row, _ = summarise(F_opt_x, F_opt_unsat, F_opt_unsat_ct, session.penalty)
+            F_best = int(jax.device_get(F_unsat))
+            if F_best < best_unsat:
+                # The fuzzed descent beat the batch: keep its descended points and their best point.
+                best_unsat, best_x_dev, best_row_dev = F_best, F_x_best, F_row
+                opt_x, opt_unsat, opt_iters, opt_unsat_ct = F_opt_x, F_opt_unsat, F_opt_iters, F_opt_unsat_ct
+
+            if F_best == 0:
+                found_sol = True
+                if not session.counting:
+                    break
+
+            # No point changed sign during the descent: the fuzz was too small to move anything, so strengthen it.
+            fuzz_mag = fuzz_mag + 1 if bool((F_x_sign == jnp.sign(F_opt_x)).all()) else 1
+            F_x = F_opt_x
+
+    iters = unsat_per_point = flips_per_point = []
+    eval_per_point: list[float] = []
+    if session.stats:
+        n_clause = session.prepared.n_clause
         eval_last = np.abs(np.asarray(aux_info[-1]))
         eval_oob = (eval_last > n_clause) & (~np.isclose(eval_last, float(n_clause)))
         if np.any(eval_oob):
             exceed = np.argwhere(eval_oob).flatten()
             logger.warning(
-                f"[{session.optimiser}] Detected numerical instability! \n Abs(eval) > {n_clause} outside tolerance!\n"
-                + f"At indices {exceed} in the most recent batch, we found:\n"
-                + f"Energy/Eval values of: {np.asarray(aux_info[-1])[exceed]}\n"
-                + f"due to an input of: \n{np.asarray(opt_x0)[exceed, :]}"
+                f"Detected numerical instability! Abs(eval) > {n_clause} outside tolerance at indices {exceed}: "
+                f"{np.asarray(aux_info[-1])[exceed]}"
             )
             if QUIT_ON_ANOMALY:
                 raise FloatingPointError("Numerical instability encountered and anomaly_quit is enabled")
+        iters = np.asarray(opt_iters).flatten().astype(int).tolist()
+        unsat_per_point = np.asarray(opt_unsat_ct).flatten().astype(int).tolist()
+        eval_per_point = np.asarray(aux_info[1]).squeeze().T.flatten().astype(float).tolist()
+        flips_per_point = (np.asarray(opt_x > 0).sum(axis=1) - np.asarray(x0_positive)).astype(int).tolist()
 
-    flips = (opt_x0 > 0).sum(axis=1) - (x0 > 0).sum(axis=1)
-    _, eval_scores = aux_info
-    eval_scores = jnp.array(eval_scores).squeeze().T
-
-    batch_best_loc = jnp.argmin(opt_unsat_ct)
-    batch_best_unsat = jnp.take(opt_unsat_ct, batch_best_loc)
-    batch_best_x = opt_x0[batch_best_loc]
-    batch_best_unsat_clauses_idx = jnp.nonzero(opt_unsat[batch_best_loc])
-
-    best_x = np.asarray(batch_best_x).copy()
-    best_unsat = np.asarray(batch_best_unsat).copy()
-    best_unsat_clauses_idx = np.asarray(batch_best_unsat_clauses_idx).copy()
-
-    threshold_hit = bool(session.unsat_h and batch_best_unsat <= session.unsat_h)
-    found_sol = threshold_hit or bool(batch_best_unsat == 0)
-
-    if session.fuzz_limit and (session.counting or not found_sol):
-        fuzz_attempt = 0
-        F_x = opt_x0[:]
-        session.f_key, s_f_key = jax.random.split(session.f_key)
-        fuzz = jax.random.uniform(s_f_key, minval=1e-7, maxval=1e-2, shape=x0.shape)
-        fuzz_mag = 1
-        while fuzz_attempt < session.fuzz_limit:
-            fuzz_mask = np.ones(F_x.shape, dtype=bool)
-            if found_sol:
-                sol_locs = jnp.argwhere(jnp.where(opt_unsat_ct < 1, 1, 0)).flatten().tolist()
-                fuzz_mask[sol_locs, :] = False
-
-            fuzz_attempt += 1
-            if fuzz_mag != 1:
-                fuzz_adj = jnp.sign(fuzz) * jnp.abs(fuzz) ** (1 / fuzz_mag)
-            else:
-                fuzz_adj = fuzz
-
-            F_x = jnp.clip(jnp.where(fuzz_mask, F_x + fuzz_adj, F_x), -1, 1)
-
-            F_opt_x, F_opt_unsat, F_opt_iters, F_opt_unsat_ct, _ = session.solver.run(F_x, fixed_vars, session.weights)
-
-            F_batch_best_loc = jnp.argmin(F_opt_unsat_ct)
-            F_batch_best_unsat = jnp.take(F_opt_unsat_ct, F_batch_best_loc)
-            F_batch_best_x = opt_x0[F_batch_best_loc]
-            F_batch_best_unsat_clauses_idx = jnp.nonzero(opt_unsat[F_batch_best_loc])
-            if F_batch_best_unsat < best_unsat:
-                best_x = np.asarray(F_batch_best_x).copy()
-                best_unsat = np.asarray(F_batch_best_unsat).copy()
-                best_unsat_clauses_idx = np.asarray(F_batch_best_unsat_clauses_idx).copy()
-                opt_x0, opt_unsat, opt_iters, opt_unsat_ct = F_x, F_opt_unsat, F_opt_iters, F_opt_unsat_ct
-
-            if F_batch_best_unsat == 0:
-                found_sol = True
-                if not session.counting:
-                    break
-
-            if (jnp.sign(F_x) == jnp.sign(F_opt_x)).all():
-                fuzz_mag += 1
-            else:
-                fuzz_mag = 1
-
-            F_x = F_opt_x
-
-    signed_best = tuple(np.sign(best_x).astype(int).tolist())
+    signed_best = tuple(np.sign(np.asarray(best_x_dev)).astype(int).tolist())
     best_str = session.prepared.var_mapper.assn_str(signed_best, session.binary_v, inc_zero=True)
 
     return AFSATBatchResult(
-        best_unsat=int(np.asarray(best_unsat).item()),
-        sat=bool(np.asarray(best_unsat).item() == 0),
+        best_unsat=best_unsat,
+        sat=best_unsat == 0,
         threshold_hit=threshold_hit,
         best_assignment_signed=signed_best,
         best_assignment_str=best_str,
-        best_unsat_clause_indices=[int(x) for x in best_unsat_clauses_idx.flatten().tolist()],
-        iters=np.array(opt_iters.flatten()).astype(int).tolist(),
-        unsat_per_point=np.array(opt_unsat_ct.flatten()).astype(int).tolist(),
-        eval_per_point=np.array(eval_scores.flatten()).astype(float).tolist(),
-        flips_per_point=np.array(flips.flatten()).astype(int).tolist(),
+        best_unsat_clause_indices=np.flatnonzero(np.asarray(best_row_dev)).astype(int).tolist(),
+        iters=iters,
+        unsat_per_point=unsat_per_point,
+        eval_per_point=eval_per_point,
+        flips_per_point=flips_per_point,
         elapsed_sec=time() - start_batch,
     )
 
@@ -714,10 +794,8 @@ def run_solver(
     counting = int(runtime_common.counting)
     rand_seed = runtime_common.rand_seed
     ffsat_seed = runtime_common.ffsat_seed
-    maxiters = optimiser_cfg.max_iters
     weight_decay = runtime_common.weight_decay
     unsat_h = int(runtime_common.unsat_thresh * 2 * n_vars) if runtime_common.unsat_thresh else 0
-    solver_tol = optimiser_cfg.tolerance
     binary_v = output_cfg.binary_v
 
     devices = jax.devices("gpu")[:n_devices]
@@ -732,19 +810,7 @@ def run_solver(
     weights = shard_tree(weights, obj_sharding)
 
     # Construct pure JAX functions (closures) and build solver.
-    obj_eval_fns, obj_verify_fns = build_eval_verify(objs, optimiser == "unbounded")
-    if runtime_afsat.drop_xor_eval and xor_rref_meta is not None and optimiser != "unbounded":
-        # The projector satisfies every XOR clause by construction -- unless a prefix fixes an
-        # RREF dependent, in which case that row is only enforced by the objective, so keep it.
-        dep_idx = np.asarray(xor_rref_meta.dependent_indices)
-        fixed_dep = 0 if prefix_vectors is None else int(np.any(np.asarray(prefix_vectors)[:, dep_idx] != 0, axis=0).sum())
-        if fixed_dep:
-            logger.info(f"Keeping XOR objective: prefixes fix {fixed_dep} RREF dependent variables")
-        else:
-            obj_eval_fns, n_dropped = drop_projected_xor_evaluators(objs, obj_eval_fns)
-            logger.info(f"XOR objective handled by RREF projection; dropped {n_dropped} evaluator(s)")
-    seq_evaluator, seq_verifier = seq_eval_verify(obj_eval_fns, obj_verify_fns, xor_rref_meta=xor_rref_meta)
-    solver = Optimiser(seq_evaluator, seq_verifier, algorithm=optimiser, maxiter=maxiters, tol=solver_tol)
+    solver = build_solver(config, objs, xor_rref_meta, prefix_vectors)
 
     seed = int(time()) if rand_seed == -1 else rand_seed
     logger.info(f"seed={seed}, rand_seed={rand_seed}")

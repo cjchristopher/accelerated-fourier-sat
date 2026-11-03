@@ -138,6 +138,23 @@ def _make_xor_projector(meta: XorRREFMetadata) -> Callable[[Array], Array]:
     return project
 
 
+def project_folded_xor(x: Array, buckets: tuple[tuple[Array, Array, Array, Array], ...]) -> Array:
+    """_make_xor_projector's projection with the rows passed in (xor_rref.pack_rows) rather than built in: the
+    per-prefix folded RREF of the Dagster worker. Unused slots carry an empty mask and an out-of-range dependent,
+    which the scatter drops."""
+    dtype = x.dtype
+    x_dep = []
+    for row_vars, row_mask, row_sign, _ in buckets:
+        sign = row_sign.astype(dtype)
+        xs = x[row_vars]
+        product = jnp.prod(jnp.where(row_mask, xs, 1.0), axis=-1)
+        negatives = jnp.sum((xs < 0) & row_mask, axis=-1)
+        parity_sign = sign * (1.0 - 2.0 * (negatives % 2)).astype(dtype)
+        x_dep.append(sign * product + parity_sign * jnp.finfo(dtype).tiny)
+    dep_idx = jnp.concatenate([dep for _, _, _, dep in buckets])
+    return x.at[dep_idx].set(jnp.concatenate(x_dep), mode="drop")
+
+
 def build_eval_verify(objs: tuple[Objective, ...], unbounded: bool) -> tuple[tuple[EvalFn, ...], tuple[VerifyFn, ...]]:
     """
     Constructs JAX-based evaluators and verifiers for a set of objectives.
@@ -268,25 +285,33 @@ def seq_eval_verify(
     eval_fns: tuple[EvalFn, ...],
     verify_fns: tuple[VerifyFn, ...],
     xor_rref_meta: XorRREFMetadata | None = None,
+    folded_xor: bool = False,
 ) -> tuple[SeqEvalFn, VerifyFn]:
     """
     Groups a collection (usually all) of Evaluation functions & Verifier functions into a sequence.
+
+    With folded_xor, the XOR projection takes its rows from the evaluator's `xor_rows` argument (the per-prefix
+    folded RREF, project_folded_xor) instead of the built-in xor_rref_meta.
     """
 
     xor_projector: Callable[[Array], Array] | None = (
-        _make_xor_projector(xor_rref_meta) if xor_rref_meta is not None else None
+        _make_xor_projector(xor_rref_meta) if xor_rref_meta is not None and not folded_xor else None
     )
 
-    def _apply_fixed_and_projection(x: Array, fixed_vars: Array) -> Array:
+    def _apply_fixed_and_projection(x: Array, fixed_vars: Array, xor_rows: Any = None) -> Array:
         x_eval = jnp.where(fixed_vars, jax.lax.stop_gradient(x), x)
-        if xor_projector is None:
+        if xor_rows is not None:
+            x_proj = project_folded_xor(x_eval, xor_rows)
+        elif xor_projector is not None:
+            x_proj = xor_projector(x_eval)
+        else:
             return x_eval
-
-        x_proj = xor_projector(x_eval)
         return jnp.where(fixed_vars, x_eval, x_proj)
 
-    def seq_evals(x: Array, fixed_vars: Array, weights: tuple[Array, ...]) -> tuple[Array, Array | tuple[Array, Array]]:
-        x_eval = _apply_fixed_and_projection(x, fixed_vars)
+    def seq_evals(
+        x: Array, fixed_vars: Array, weights: tuple[Array, ...], xor_rows: Any = None
+    ) -> tuple[Array, Array | tuple[Array, Array]]:
+        x_eval = _apply_fixed_and_projection(x, fixed_vars, xor_rows)
         costs = [evaluate(x_eval, fixed_vars, weight) for (evaluate, weight) in zip(eval_fns, weights)]
         cost = jnp.sum(jnp.array(costs))
         return cost, (x_eval, cost)  
@@ -430,18 +455,19 @@ class Optimiser(abc.ABC):
         else:
             pass
 
-    def compile(self, x0: Any, fixed_vars: Any, weights: tuple[Any, ...]) -> Any:
+    def compile(self, x0: Any, fixed_vars: Any, weights: tuple[Any, ...], *extra: Any) -> Any:
         """Compile the batch kernel ahead of time for these shapes and shardings (arrays or ShapeDtypeStructs).
 
         Lowered on the kernel's own jitted object, so a later call with matching arguments reuses this executable
         instead of compiling again (lowering a fresh jax.jit wrapper around it would not). Returns the Compiled
-        object: memory_analysis() for batch sizing, out_info for compiling what consumes the kernel's outputs."""
+        object: memory_analysis() for batch sizing, out_info for compiling what consumes the kernel's outputs.
+        `extra` is the optional folded-XOR rows argument (run)."""
         if self._loop_controlled:
             runner = self._kernel(self._loops_for(x0))
         else:
             runner = self.run if self.algo not in ["sp-lbfgsb"] else self.eval_fun
         lower = runner.lower if hasattr(runner, "lower") else jax.jit(runner).lower
-        return lower(x0, fixed_vars, weights).compile()
+        return lower(x0, fixed_vars, weights, *extra).compile()
 
     def peak_memory_estimation(self, x0: Any, fixed_vars: Any, weights: tuple[Any, ...]) -> int:
         return self.peak_bytes(self.compile(x0, fixed_vars, weights))
@@ -468,9 +494,11 @@ class Optimiser(abc.ABC):
                     fun=evaluator, maxiter=self.maxiter, has_aux=True, tol=tol, unroll=outer, ls_unroll=line_search
                 )
 
-                def solve(x: Array, fixed_vars: Array, weights: tuple[Array, ...]) -> tuple[Array, Array]:
+                def solve(x: Array, fixed_vars: Array, weights: tuple[Array, ...], **kw: Any) -> tuple[Array, Array]:
                     bounds = (-1 * jnp.ones_like(x), jnp.ones_like(x))
-                    x_opt, state = lbfgsb.run(init_params=x, fixed_vars=fixed_vars, weights=weights, bounds=bounds)
+                    x_opt, state = lbfgsb.run(
+                        init_params=x, fixed_vars=fixed_vars, weights=weights, bounds=bounds, **kw
+                    )
                     return x_opt, state.iter_num
 
             else:
@@ -483,20 +511,23 @@ class Optimiser(abc.ABC):
                     unroll=outer, ls_unroll=line_search,
                 )
 
-                def solve(x: Array, fixed_vars: Array, weights: tuple[Array, ...]) -> tuple[Array, Array]:
-                    x_opt, state = pgd.run(x, fixed_vars=fixed_vars, weights=weights, hyperparams_proj=(-1, 1))
+                def solve(x: Array, fixed_vars: Array, weights: tuple[Array, ...], **kw: Any) -> tuple[Array, Array]:
+                    x_opt, state = pgd.run(x, fixed_vars=fixed_vars, weights=weights, hyperparams_proj=(-1, 1), **kw)
                     return x_opt, state.iter_num
 
-            def opt(x: Array, fixed_vars: Array, weights: tuple[Array, ...]):
-                x_opt, iters = solve(x, fixed_vars, weights)
-                final_cost, eval_aux = evaluator(x_opt, fixed_vars, weights)
+            # `extra` is empty, or the folded-XOR rows (seq_eval_verify(folded_xor=True)), shared by every point.
+            def opt(x: Array, fixed_vars: Array, weights: tuple[Array, ...], *extra: Any):
+                kw = {"xor_rows": extra[0]} if extra else {}
+                x_opt, iters = solve(x, fixed_vars, weights, **kw)
+                final_cost, eval_aux = evaluator(x_opt, fixed_vars, weights, **kw)
                 x_eval = eval_aux[0]
                 final_aux: Any = (x_eval, final_cost)
                 unsat = jnp.squeeze(verifier(x_eval))
                 return x_eval, jnp.atleast_1d(unsat), jnp.atleast_1d(iters), final_aux
 
-            def vectorise(xs: Array, fixed_vars: Array, weights: tuple[Array, ...]):
-                x_opt, unsat, iters, evals = jax.vmap(opt, in_axes=(0, 0, None))(xs, fixed_vars, weights)
+            def vectorise(xs: Array, fixed_vars: Array, weights: tuple[Array, ...], *extra: Any):
+                in_axes = (0, 0, None) + (None,) * len(extra)
+                x_opt, unsat, iters, evals = jax.vmap(opt, in_axes=in_axes)(xs, fixed_vars, weights, *extra)
                 unsat_cl_count = jnp.sum(jnp.atleast_2d(unsat), axis=1)
                 return x_opt, jnp.atleast_2d(unsat), iters, unsat_cl_count, evals
 
@@ -511,9 +542,12 @@ class Optimiser(abc.ABC):
         outer, line_search = choose_loops(self.algo, xs.shape[0] // max(n_devices, 1))
         return outer or bool(self.unroll), line_search
 
-    def run(self, xs: Array, fixed_vars: Array, weights: tuple[Array, ...]) -> tuple[Array, Array, Array, Array, Array]:
-        """Optimise a batch (lbfgsb/pgd). Other algorithms assign `self.run` in __init__, which shadows this."""
-        return self._kernel(self._loops_for(xs))(xs, fixed_vars, weights)
+    def run(
+        self, xs: Array, fixed_vars: Array, weights: tuple[Array, ...], *extra: Any
+    ) -> tuple[Array, Array, Array, Array, Array]:
+        """Optimise a batch (lbfgsb/pgd). Other algorithms assign `self.run` in __init__, which shadows this.
+        `extra` is the optional folded-XOR rows argument."""
+        return self._kernel(self._loops_for(xs))(xs, fixed_vars, weights, *extra)
 
     def warmup(self, warmup_data: tuple[Array, Array, tuple[Array, ...]], counting: bool = False) -> None:
         if warmup_data:

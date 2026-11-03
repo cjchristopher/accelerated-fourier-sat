@@ -293,12 +293,15 @@ def main() -> None:
     runtime_common_opts("-c", "--counting", action="store_true", field="counting", help="Counting mode")
     runtime_common_opts("-s", "--seed", default=156322, type=int, field="rand_seed", help="Force initialise seed (non-negative int)")
     runtime_common_opts("-u", "--unsat_thresh", type=float, field="unsat_thresh", help="Threshold for early stop")
-    runtime_common_opts("-m", "--sample_meth", type=str, field="sample_method", choices=SAMPLERS, help="Sampler")
+    runtime_common_opts("-m", "--sample_meth", type=str, field="pt_sampler", choices=SAMPLERS, help="Sampler")
 
     runtime_afsat_opts = make_option_group("Runtime AFSAT Aliases", "runtime_afsat")
     runtime_afsat_opts("-b", "--batch", type=int, field="batch_per_device", help="Batch size per device")
     runtime_afsat_opts("-f", "--fuzz", type=int, field="fuzz", help="Fuzz attempts")
-    runtime_afsat_opts("-w", "--warmup", action="store_true", field="warmup", help="Warmup before requests")
+    runtime_afsat_opts(
+        "-w", "--warmup", action="store_true", field="warmup",
+        help="Accepted for compatibility: the worker always compiles before reporting READY",
+    )
     runtime_afsat_opts("--xor_rref", action="store_true", field="xor_rref", help="Enable XOR RREF projection")
 
     optimiser_opts = make_option_group("Optimiser Aliases", "optimiser")
@@ -309,6 +312,7 @@ def main() -> None:
     output_opts = make_option_group("Output Aliases", "output_logging")
     output_opts("-d", "--debug", choices=LOG_LEVELS, field="debug_level", help=f"Set logging level ({LOG_LEVELS})")
     output_opts("--binary_v", action="store_true", field="binary_v", help="Use binary assignment string")
+    output_opts("--stats", action="store_true", field="stats", help="Per-descent statistics and anomaly checks")
 
     ap.add_argument("--phase", type=int, default=0, help="Current Dagster phase")
     ap.add_argument("--helper-rank", type=int, default=0, help="Helper rank within local group")

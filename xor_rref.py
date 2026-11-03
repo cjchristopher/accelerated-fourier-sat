@@ -339,3 +339,145 @@ def preprocess_xor_system(
     # out before reduction and are no longer columns at all.
     derived.update(forced)
     return XorPreprocessResult(meta, derived, False)
+
+
+# --- Per-prefix folding (Dagster worker): claude_scratch/14_phase1_prefix_rref_plan.md, D3 / E7 / E8 ----------------
+#
+# A row is (dependent, support, bit) with variable indices and bit 1 = TRUE, asserting
+# dependent XOR (XOR of support) = bit; the projector computes it as x_dep = (1 - 2 bit) * prod x_support.
+# A prefix fixes some variables. Folding it into the RREF built without it keeps every XOR clause satisfied by
+# construction: a fixed free variable is substituted out of its rows; a fixed dependent hands its row's pivot to one
+# of the row's free variables, which is then eliminated from the other rows (fill-in is possible); a row left with no
+# support either forces its dependent (a unit for this prefix) or, if that contradicts the prefix, refutes it.
+# Rows only ever disappear, never appear, so the folded system fits the same number of row slots.
+
+XorRow = tuple[int, list[int], int]
+
+
+def rref_rows(meta: XorRREFMetadata) -> list[XorRow]:
+    """The metadata's rows as (dependent, support, bit), read once on the host."""
+    row_vars, row_mask = np.asarray(meta.row_vars), np.asarray(meta.row_mask)
+    dep, bits = np.asarray(meta.dependent_indices), np.asarray(meta.b_final)
+    return [(int(dep[i]), row_vars[i][row_mask[i]].astype(int).tolist(), int(bits[i])) for i in range(dep.size)]
+
+
+class FoldResult(NamedTuple):
+    rows: list[XorRow]  # live rows: dependent and support all unfixed
+    forced: dict[int, int]  # variable index -> bit, dependents the prefix determines
+
+
+def fold_prefix(rows: list[XorRow], prefix: np.ndarray) -> FoldResult | None:
+    """Fold a prefix vector (-1 TRUE, +1 FALSE, 0 unfixed, per variable) into the RREF rows; None if the prefix
+    contradicts the XOR system."""
+    fixed = {int(v): int(prefix[v] < 0) for v in np.flatnonzero(prefix)}
+    deps = [d for d, _, _ in rows]
+    supports = [set(s) for _, s, _ in rows]
+    bits = [b for _, _, b in rows]
+    pivot_of = {d: i for i, d in enumerate(deps)}
+    occurs: dict[int, set[int]] = {}
+    for i, s in enumerate(supports):
+        for v in s:
+            occurs.setdefault(v, set()).add(i)
+
+    # Fixed free variables: substitute their values.
+    for v, b in fixed.items():
+        for i in occurs.pop(v, ()):
+            supports[i].discard(v)
+            bits[i] ^= b
+
+    # Fixed dependents: d XOR S = bit with d = c gives S = bit XOR c. Re-pivot on the least-shared variable q of S
+    # (fewest other rows to update), q = (bit XOR c) XOR (S - q), and eliminate q from every other row.
+    dead = set()
+    for d, c in fixed.items():
+        i = pivot_of.pop(d, None)
+        if i is None:
+            continue
+        beta = bits[i] ^ c
+        if not supports[i]:
+            if beta:
+                return None  # 0 = 1: the prefix contradicts this row
+            dead.add(i)
+            continue
+        q = min(supports[i], key=lambda v: (len(occurs[v]), v))
+        rest = supports[i] - {q}
+        for v in supports[i]:
+            occurs[v].discard(i)
+        deps[i], supports[i], bits[i] = q, rest, beta
+        pivot_of[q] = i
+        for j in occurs.pop(q, set()):
+            # Row j: d_j XOR q XOR R = bit_j, and q = beta XOR rest, so d_j XOR (R ^ rest) = bit_j XOR beta.
+            supports[j].discard(q)
+            for v in rest:
+                if v in supports[j]:
+                    supports[j].remove(v)
+                    occurs[v].discard(j)
+                else:
+                    supports[j].add(v)
+                    occurs.setdefault(v, set()).add(j)
+            bits[j] ^= beta
+        for v in rest:
+            occurs.setdefault(v, set()).add(i)
+
+    live, forced = [], {}
+    for i, d in enumerate(deps):
+        if i in dead:
+            continue
+        if supports[i]:
+            live.append((d, sorted(supports[i]), bits[i]))
+        else:
+            forced[d] = bits[i]  # a dependent the prefix determines; its row has nothing left to project
+    return FoldResult(live, forced)
+
+
+class FoldLayout(NamedTuple):
+    """Fixed slot layout for folded rows: per bucket a support width and a row capacity. The shapes never change,
+    so a new prefix is a device_put, not a recompile. Capacities are the unfolded system's rows per width plus spare
+    slots, and a wider bucket takes fill-in; an unused slot has an empty mask and an out-of-range dependent, so the
+    projector's scatter drops it."""
+
+    widths: tuple[int, ...]
+    capacities: tuple[int, ...]
+    n_var: int
+
+
+def make_fold_layout(rows: list[XorRow], n_var: int, spare: float = 0.05, min_spare: int = 16) -> FoldLayout:
+    """Power-of-two width buckets, as the bucketed projector uses, each with spare slots in proportion to its rows
+    (at least min_spare), plus one bucket of min_spare slots at twice the widest for fill-in. Spare slots cost
+    projector work at their bucket's width, so they are kept small: a cube widens few rows, and a row that finds no
+    free slot sends that request to the fallback kernel."""
+    sizes = np.array([max(len(s), 1) for _, s, _ in rows])
+    widths = 2 ** np.ceil(np.log2(np.maximum(sizes, 1))).astype(np.int64)
+    top = int(widths.max()) if widths.size else 1
+    bucket_widths = sorted({int(w) for w in widths} | {2 * top})
+    counts = [int((widths == w).sum()) for w in bucket_widths]
+    capacities = tuple(c + max(min_spare, int(np.ceil(spare * c))) for c in counts)
+    return FoldLayout(tuple(bucket_widths), capacities, n_var)
+
+
+def pack_rows(layout: FoldLayout, rows: list[XorRow]) -> tuple[tuple[np.ndarray, ...], ...] | None:
+    """Place rows into the layout's slots: per bucket (row_vars, row_mask, row_sign, dependent_indices). Each row
+    goes to the narrowest bucket wide enough with a free slot; None if a row fits nowhere (overflow)."""
+    free = list(layout.capacities)
+    placed: list[list[XorRow]] = [[] for _ in layout.widths]
+    for row in rows:
+        size = max(len(row[1]), 1)
+        for k, width in enumerate(layout.widths):
+            if width >= size and free[k]:
+                placed[k].append(row)
+                free[k] -= 1
+                break
+        else:
+            return None
+    buckets = []
+    for width, cap, group in zip(layout.widths, layout.capacities, placed):
+        row_vars = np.zeros((cap, width), dtype=np.int32)
+        row_mask = np.zeros((cap, width), dtype=bool)
+        row_sign = np.ones(cap, dtype=np.float32)
+        dep = np.full(cap, layout.n_var, dtype=np.int32)  # unused slot: out of range, dropped by the scatter
+        for r, (d, support, bit) in enumerate(group):
+            row_vars[r, : len(support)] = support
+            row_mask[r, : len(support)] = True
+            row_sign[r] = 1.0 - 2.0 * bit
+            dep[r] = d
+        buckets.append((row_vars, row_mask, row_sign, dep))
+    return tuple(buckets)

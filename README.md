@@ -129,7 +129,7 @@ python afsat.py [options] input_file.cnf
 - `-d, --debug LEVEL`: Set logging level: DEBUG, INFO, WARNING, or ERROR (default: ERROR)
 - `-e, --benchmark`: Enable benchmark mode (reduces output verbosity)
 - `-c, --counting`: Counting mode - count/enumerate solutions until timeout (default: False (off))
-- `-w, --warmup`: Perform a warmup run before starting the timer (may improve performance with JAX compilation cache)
+- `-w, --warmup`: Compile the solver (sampler, search kernel, bookkeeping) ahead of time, before the timer starts
 - `-s, --rand_seed`: Randomize the random seed (default: uses fixed seed for reproducibility)
 - `-p, --prefix FILE`: Path to file containing fixed variable assignments (one assignment per line, using SAT solver output format with negated literals)
 - `-y, --profile`: Enable profiling (saves JAX trace to `/tmp/jax-trace` and device memory profile to `memory.prof`)
