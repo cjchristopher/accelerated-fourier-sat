@@ -136,6 +136,7 @@ python afsat.py [options] input_file.cnf
 - `-u, --unsat_thresh FLOAT`: Implemented to replicate a benchmark in `FastFourierSAT` - treats a problem as solved when at least `(1-unsat-thresh)*#clauses` clauses are `True`
 - `-m, --sample_meth STR`: New candidate assignments can be randomly sampled in various ways. Default is `bias`, options are `bias, coin, uniform, trunc`. Documentation TBD.
 - `-q, --solver_tol FLOAT`: For convergence criteria solvers (e.g. gradient descent), overrides the default threshold for which convergence is deemed to have been met.
+- `--eo_simplex`: Treat exactly-one (EO) groups as simplices (`eo_simplex.py`). One disjoint family of all-positive `eo` groups is chosen; each group's variables are searched as a probability vector on a simplex, its EO clause leaves the objective, and points are decoded by argmax per group. Clearly better on Ramsey and sudoku encodings, mixed on Costas arrays, worse where the encoding adds symmetry-breaking constraints. PGD only; ignored with `-u` (it enforces EO as hard) and with an active XOR RREF projection.
 - `--stdout_log`: Sends output from logger (e.g. when `--debug` is set) to stdout instead of stderr.
 - `--anomaly_quit`: Will cause the solver to immediately halt if numerical instability is detected (e.g. total evaluation is outside expected bounds)
 
