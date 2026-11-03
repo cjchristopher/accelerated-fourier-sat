@@ -4,6 +4,7 @@ from __future__ import annotations
 import abc
 import functools
 import logging
+import os
 from collections.abc import Callable
 from time import perf_counter as time
 from typing import Any, TypeAlias
@@ -16,10 +17,8 @@ import numpy as np
 from jax import Array
 from jaxopt import (
     LBFGS,
-    LBFGSB,
     GradientDescent,
     NonlinearCG,
-    ProjectedGradient,
     ProximalGradient,
     ScipyBoundedMinimize,
 )
@@ -30,7 +29,10 @@ from scipy.optimize import Bounds, OptimizeResult
 from scipy.optimize import minimize as ScipyMinimize
 
 from boolean_whf import Objective, clause_type_ids
+from fe_spectrum import fe_eval_mode, make_clause_eval
 from xor_rref import XorRREFMetadata
+
+from .loop_control import LoopAwareLBFGSB, LoopAwareProjectedGradient, choose_loops
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +73,36 @@ def _bind_unsat_rule(template: UnsatRule, mask: Array, cards: Array) -> Callable
     return lambda x, _t=template, _m=mask, _c=cards: _t(x, _m, _c)
 
 
+def _xor_projector_buckets(meta: XorRREFMetadata) -> list[tuple[Array, Array, Array, Array]]:
+    """RREF rows grouped by support size, as (row_vars, row_mask, row_sign, dependent_indices) per group.
+
+    The metadata pads every row to the longest one, but RREF row weights are heavily skewed (SHA-1 r50:
+    median 3, max 109), so a single padded block is ~90% padding, and the gather, product and gradient
+    scatter all scale with the padded size. Rows are grouped into power-of-two widths (the last group
+    capped at the longest row), so at most ~log2(K) blocks, each at least half full. Rows are independent
+    (RREF supports hold only free variables, and each row writes only its own dependent), so grouping
+    changes neither the values nor the gradients. AFSAT_XOR_PROJECTOR=padded keeps the single block.
+    """
+    row_vars, row_mask = np.asarray(meta.row_vars), np.asarray(meta.row_mask)
+    row_sign, dep_idx = np.asarray(meta.row_sign), np.asarray(meta.dependent_indices)
+    if os.environ.get("AFSAT_XOR_PROJECTOR", "bucketed").strip().lower() == "padded":
+        return [(meta.row_vars, meta.row_mask, meta.row_sign, meta.dependent_indices)]
+    # Supports are left-aligned in each padded row, so a group of width w keeps the first w columns.
+    weights = row_mask.sum(axis=-1)
+    widths = np.minimum(2 ** np.ceil(np.log2(np.maximum(weights, 1))).astype(np.int64), row_vars.shape[-1])
+    buckets = []
+    for width in np.unique(widths):
+        rows = np.flatnonzero(widths == width)
+        buckets.append((jnp.asarray(row_vars[rows, :width]), jnp.asarray(row_mask[rows, :width]),
+                        jnp.asarray(row_sign[rows]), jnp.asarray(dep_idx[rows])))
+    shapes = [tuple(group[0].shape) for group in buckets]
+    used = int(weights.sum())
+    logger.info(f"XOR projector: {len(shapes)} row groups (rows, width) {shapes}, "
+                f"{used / max(sum(r * w for r, w in shapes), 1):.0%} of entries used "
+                f"(single padded block: {used / max(row_vars.size, 1):.0%})")
+    return buckets
+
+
 def _make_xor_projector(meta: XorRREFMetadata) -> Callable[[Array], Array]:
     """Overwrite each RREF dependent with the value its row derives from the free variables.
 
@@ -84,21 +116,24 @@ def _make_xor_projector(meta: XorRREFMetadata) -> Callable[[Array], Array]:
     `parity_sign * tiny` term fixes that. Whenever the product is non-zero it has the same sign
     as the product (so it only perturbs the magnitude by `tiny`), when the product is 0 it
     supplies the parity sign alone, and it is piecewise constant, so gradients are untouched.
+
+    Rows are evaluated in groups of similar support size (_xor_projector_buckets) and written back
+    with one scatter.
     """
-    row_vars = meta.row_vars
-    row_mask = meta.row_mask
-    row_sign = meta.row_sign
-    dep_idx = meta.dependent_indices
+    buckets = _xor_projector_buckets(meta)
+    dep_idx = jnp.concatenate([dep for _, _, _, dep in buckets])
 
     def project(x: Array) -> Array:
         dtype = x.dtype
-        sign = row_sign.astype(dtype)
-        xs = x[row_vars]  # (n_dep, K)
-        product = jnp.prod(jnp.where(row_mask, xs, 1.0), axis=-1)
-        negatives = jnp.sum((xs < 0) & row_mask, axis=-1)
-        parity_sign = sign * (1.0 - 2.0 * (negatives % 2)).astype(dtype)
-        x_dep = sign * product + parity_sign * jnp.finfo(dtype).tiny
-        return x.at[dep_idx].set(x_dep)
+        x_dep = []
+        for row_vars, row_mask, row_sign, _ in buckets:
+            sign = row_sign.astype(dtype)
+            xs = x[row_vars]  # (rows in group, group width)
+            product = jnp.prod(jnp.where(row_mask, xs, 1.0), axis=-1)
+            negatives = jnp.sum((xs < 0) & row_mask, axis=-1)
+            parity_sign = sign * (1.0 - 2.0 * (negatives % 2)).astype(dtype)
+            x_dep.append(sign * product + parity_sign * jnp.finfo(dtype).tiny)
+        return x.at[dep_idx].set(jnp.concatenate(x_dep))
 
     return project
 
@@ -121,6 +156,8 @@ def build_eval_verify(objs: tuple[Objective, ...], unbounded: bool) -> tuple[tup
             - verifiers (tuple[Verifier, ...]): Given assignment, check satisfaction of an objective.
     """
 
+    fe_mode = fe_eval_mode()
+
     def single_eval_verify(obj: Objective) -> tuple[EvalFn, VerifyFn]:
         lits = obj.clauses.lits
         sign = obj.clauses.sign
@@ -141,6 +178,10 @@ def build_eval_verify(objs: tuple[Objective, ...], unbounded: bool) -> tuple[tup
             if clause_type_ids[clause_type] in type_ids_present
         ]
 
+        # FE construction from fe_spectrum.py (default: folded nodes form, closed forms for OR/NAE);
+        # AFSAT_FE_EVAL=esp_full keeps the original kernel below.
+        alt_clause_eval = None if fe_mode == ("esp", False) or is_xor_obj else make_clause_eval(obj, *fe_mode)
+
         # fmt: off
         def evaluate_xor(x: Array, fixed_vars: Array, weight: Array) -> Array:
             x = jnp.where(fixed_vars, jax.lax.stop_gradient(x), x)
@@ -157,11 +198,14 @@ def build_eval_verify(objs: tuple[Objective, ...], unbounded: bool) -> tuple[tup
         def evaluate(x: Array, fixed_vars: Array, weight: Array) -> Array:
             x = jnp.where(fixed_vars, jax.lax.stop_gradient(x), x)
             assignment = sign * x[lits]                                           # (N,K) * (N,K) = (N,K)
-            # Add dim to capture K+1 shifted roots for K terms of the clause.
-            fourier_domain = dft + assignment[:, None, :]                         # (N,(K+1),1) + (N,_,K) = (N,(K+1),K)
-            esp_freq = jnp.prod(fourier_domain, axis=-1, where=forward_mask)      # (N,(K+1))
-            esp_eval = idft * esp_freq                                            # (1,(K+1)) * (N,(K+1)) = (N,(K+1))
-            clause_eval = jnp.sum(esp_eval.real, axis=-1)                         # (N,)
+            if alt_clause_eval is not None:
+                clause_eval = alt_clause_eval(assignment)                         # (N,)
+            else:
+                # Add dim to capture K+1 shifted roots for K terms of the clause.
+                fourier_domain = dft + assignment[:, None, :]                     # (N,(K+1),1) + (N,_,K) = (N,(K+1),K)
+                esp_freq = jnp.prod(fourier_domain, axis=-1, where=forward_mask)  # (N,(K+1))
+                esp_eval = idft * esp_freq                                        # (1,(K+1)) * (N,(K+1)) = (N,(K+1))
+                clause_eval = jnp.sum(esp_eval.real, axis=-1)                     # (N,)
             weighted_eval = weight * clause_eval                                  # (N,) * (N,) = (N,)
             x_eval = jnp.sum(weighted_eval, axis=-1)                              # (1,)
             if not unbounded:
@@ -256,54 +300,6 @@ def seq_eval_verify(
     return seq_evals, seq_verifies
 
 
-# jaxopt offers two jittable loop strategies and they trade off in opposite
-# directions under vmap. lax.while_loop stops once every start in the batch is
-# done, but pays a dynamic trip count and a predicate reduction each iteration.
-# The unrolled path is a fixed-length lax.scan: cheaper per iteration, but its
-# early-exit cond degenerates to a select under vmap, so it always runs the full
-# maxiter. Measured on GPU the while_loop iteration costs ~1.5x the scan
-# iteration, so the scan wins exactly when the while_loop would run past this
-# fraction of maxiter.
-SCAN_BREAKEVEN_FRAC = 0.65
-
-
-def _unroll_decision(iters: Array, maxiter: int, batch: int) -> tuple[bool, dict[str, float]]:
-    """Pick a loop strategy from the warmup iteration counts.
-
-    Under vmap the while_loop runs until *every* start is done, so its cost is
-    set by max(iters), not by the mean -- one straggler costs as much as a fully
-    saturated batch. The question is therefore not whether a lone deep start was
-    an outlier, but whether a future batch is likely to contain one: if a
-    fraction q of starts run deep, a batch of B holds at least one with
-    probability 1 - (1 - q)**B, which for q = 1/1000 and B = 1000 is already
-    63%. Rare stragglers are a reason to prefer the scan, not to discount.
-    """
-    flat = np.asarray(iters).reshape(-1).astype(np.float64)
-    threshold = SCAN_BREAKEVEN_FRAC * maxiter
-    deep = flat >= threshold
-    q = float(deep.mean()) if flat.size else 0.0
-    # Probability that a future batch of this size contains at least one deep start.
-    p_deep = 1.0 - (1.0 - q) ** max(batch, 1)
-    shallow = flat[~deep]
-    shallow_max = float(shallow.max()) if shallow.size else 0.0
-    # Expected while_loop trip count = max over the batch, which is maxiter
-    # whenever any start runs deep and the shallow maximum otherwise.
-    expected_trips = p_deep * maxiter + (1.0 - p_deep) * shallow_max
-
-    stats = {
-        "mean": float(flat.mean()) if flat.size else 0.0,
-        "median": float(np.median(flat)) if flat.size else 0.0,
-        "stdev": float(flat.std()) if flat.size else 0.0,
-        "p99": float(np.percentile(flat, 99)) if flat.size else 0.0,
-        "max": float(flat.max()) if flat.size else 0.0,
-        "frac_deep": q,
-        "p_deep_batch": p_deep,
-        "expected_trips": expected_trips,
-        "breakeven": threshold,
-    }
-    return expected_trips > threshold, stats
-
-
 class Optimiser(abc.ABC):
     def __init__(
         self,
@@ -319,15 +315,22 @@ class Optimiser(abc.ABC):
         self.warmup_sol = False
         self.warmup_x: NDArray | None = None
         self.unroll = unroll
-        # Kept so warmup can rebuild the solver once it has seen real iteration counts.
-        self._build_args = (evaluator, verifier, algorithm, maxiter, tol)
+        # lbfgsb/pgd: one jitted kernel per (outer loop unrolled, line search unrolled), built on first use and
+        # chosen from the batch size (solvers/loop_control.py). `unroll=True` unrolls the outer loop.
+        self._evaluator, self._verifier, self._tol = evaluator, verifier, tol
+        self._loop_controlled = algorithm in ["lbfgsb", "pgd"]
+        self._kernels: dict[tuple[bool, bool], Callable] = {}
 
         # TODO: Change to optimistix when mature.
         # if self.sol_name in ["optim"]:
         #     self.solver = BoundedBFGS()
         #     self.solver = optimistix.minimise(evaluator, BoundedBFGS, args={'weights': weights}, has_aux=True)
 
-        if self.algo in ["lbfgsb", "pgd", "josp-lbfgsb", "unbounded", "unbounded2"]:
+        if self._loop_controlled:
+            logger.info(f"Setting up JAXOPT {'L-BFGS-B' if self.algo == 'lbfgsb' else 'Projected Gradient (Box)'}"
+                        " (loop strategy chosen from the batch size)")
+
+        elif self.algo in ["josp-lbfgsb", "unbounded", "unbounded2"]:
             # probably change to if sol_name in JAX_OPTIMS
             if self.algo in ["unbounded2"]:
                 lbfgs = LBFGS(fun=evaluator, maxiter=self.maxiter, has_aux=True, tol=tol)
@@ -353,20 +356,7 @@ class Optimiser(abc.ABC):
                     unsat = jnp.squeeze(verifier(x_eval))
                     return x_eval, unsat, jnp.atleast_1d(state.iter_num), final_aux
 
-            if self.algo in ["lbfgsb"]:
-                lbfgsb = LBFGSB(fun=evaluator, maxiter=self.maxiter, has_aux=True, tol=tol, unroll=self.unroll)
-                logger.info("Setting up JAXOPT L-BFGS-B:")
-
-                def opt(x: Array, fixed_vars: Array, weights: tuple[Array, ...]) -> tuple[Array, Array, Array, Array]:
-                    bounds = (-1 * jnp.ones_like(x), jnp.ones_like(x))
-                    x_opt, state = lbfgsb.run(init_params=x, fixed_vars=fixed_vars, weights=weights, bounds=bounds)
-                    final_cost, eval_aux = evaluator(x_opt, fixed_vars, weights)
-                    x_eval = eval_aux[0]
-                    final_aux: Any = (x_eval, final_cost)
-                    unsat = jnp.squeeze(verifier(x_eval))
-                    return x_eval, unsat, jnp.atleast_1d(state.iter_num), final_aux
-
-            elif self.algo in ["josp-lbfgsb"]:
+            if self.algo in ["josp-lbfgsb"]:
                 spminB = ScipyBoundedMinimize(
                     fun=evaluator, method="L-BFGS-B", maxiter=self.maxiter, has_aux=True, tol=tol
                 )
@@ -380,29 +370,6 @@ class Optimiser(abc.ABC):
                     final_aux: Any = (x_eval, final_cost)
                     unsat = jnp.squeeze(verifier(x_eval))
                     return x_eval, unsat, jnp.atleast_1d(state.iter_num), final_aux
-
-            elif self.algo in ["pgd"]:
-                # Leave implicit_diff on: it is free (the custom_vjp only records a
-                # differentiation rule, and the optimised HLO is identical either way),
-                # and it is what makes the solve differentiable w.r.t. weights. What is
-                # NOT free is that jaxopt derives unroll from implicit_diff when unroll is
-                # "auto", so turning it off silently switches the solver loop to a
-                # full-length lax.scan whose early-exit cond degenerates to a select under
-                # vmap -- every start then pays all `maxiter` iterations. unroll is pinned
-                # rather than left on "auto" so that coupling cannot bite; warmup retunes
-                # it from observed iteration counts (see _unroll_decision).
-                pgd = ProjectedGradient(
-                    fun=evaluator, projection=box, maxiter=self.maxiter, has_aux=True, tol=tol, unroll=self.unroll
-                )
-                logger.info("Setting up JAXOPT Projected Gradient (Box)")
-
-                def opt(x: Array, fixed_vars: Array, weights: tuple[Array, ...]) -> tuple[Array, Array, Array, Array]:
-                    x_opt, state = pgd.run(x, fixed_vars=fixed_vars, weights=weights, hyperparams_proj=(-1, 1))
-                    final_cost, eval_aux = evaluator(x_opt, fixed_vars, weights)
-                    x_eval = eval_aux[0]
-                    final_aux: Any = (x_eval, final_cost)
-                    unsat = jnp.squeeze(verifier(x_eval))
-                    return x_eval, jnp.atleast_1d(unsat), jnp.atleast_1d(state.iter_num), final_aux
 
             else:
                 pass
@@ -464,7 +431,10 @@ class Optimiser(abc.ABC):
             pass
 
     def peak_memory_estimation(self, x0: Array, fixed_vars: Array, weights: tuple[Array, ...]) -> int:
-        runner = self.run if self.algo not in ["sp-lbfgsb"] else self.eval_fun
+        if self._loop_controlled:
+            runner = self._kernel(self._loops_for(x0))
+        else:
+            runner = self.run if self.algo not in ["sp-lbfgsb"] else self.eval_fun
         traced = runner.trace(x0, fixed_vars, weights)
         lowered = traced.lower()
         compiled = lowered.compile()
@@ -478,56 +448,70 @@ class Optimiser(abc.ABC):
         )
         return int(peak_est)
 
-    def _retune_unroll(
-        self,
-        iters: Array,
-        x0_spec: tuple[tuple[int, ...], Any],
-        fixed_vars: Array,
-        weights: tuple[Array, ...],
-    ) -> None:
-        """Rebuild the solver if warmup says the other loop strategy is cheaper.
+    def _kernel(self, loops: tuple[bool, bool]) -> Callable:
+        """The jitted batch kernel for (outer loop unrolled, line search unrolled), built on first use."""
+        if loops not in self._kernels:
+            outer, line_search = loops
+            evaluator, verifier, tol = self._evaluator, self._verifier, self._tol
+            if self.algo == "lbfgsb":
+                lbfgsb = LoopAwareLBFGSB(
+                    fun=evaluator, maxiter=self.maxiter, has_aux=True, tol=tol, unroll=outer, ls_unroll=line_search
+                )
 
-        Warmup already solves the real instance, so its iteration counts are a
-        direct sample of this problem rather than a guess from its class.
-        """
-        if self.algo not in ["lbfgsb", "pgd"]:
-            return
+                def solve(x: Array, fixed_vars: Array, weights: tuple[Array, ...]) -> tuple[Array, Array]:
+                    bounds = (-1 * jnp.ones_like(x), jnp.ones_like(x))
+                    x_opt, state = lbfgsb.run(init_params=x, fixed_vars=fixed_vars, weights=weights, bounds=bounds)
+                    return x_opt, state.iter_num
 
-        shape, dtype = x0_spec
-        batch = shape[0] if shape else 1
-        want_unroll, stats = _unroll_decision(iters, self.maxiter, batch)
-        logger.info(
-            "Warmup iteration counts: mean=%.1f median=%.1f stdev=%.1f p99=%.1f max=%.0f "
-            "(maxiter=%d); %.2f%% of starts run past the %.0f-iteration breakeven, so a "
-            "batch of %d contains one with p=%.2f -> expected while_loop trips %.0f",
-            stats["mean"], stats["median"], stats["stdev"], stats["p99"], stats["max"],
-            self.maxiter, 100.0 * stats["frac_deep"], stats["breakeven"], batch,
-            stats["p_deep_batch"], stats["expected_trips"],
-        )
-        if want_unroll == self.unroll:
-            logger.info("Keeping unroll=%s", self.unroll)
-            return
+            else:
+                # Leave implicit_diff on: it is free (the custom_vjp only records a differentiation rule, and the
+                # optimised HLO is identical either way), and it is what makes the solve differentiable w.r.t.
+                # weights. jaxopt derives unroll from implicit_diff when unroll is "auto", so both loop strategies
+                # are always pinned explicitly here.
+                pgd = LoopAwareProjectedGradient(
+                    fun=evaluator, projection=box, maxiter=self.maxiter, has_aux=True, tol=tol,
+                    unroll=outer, ls_unroll=line_search,
+                )
 
-        logger.info("Switching unroll=%s -> %s and recompiling", self.unroll, want_unroll)
-        t0 = time()
-        evaluator, verifier, algorithm, maxiter, tol = self._build_args
-        warmup_sol = self.warmup_sol
-        self.__init__(evaluator, verifier, algorithm, maxiter, tol, unroll=want_unroll)  # type: ignore[misc]
-        self.warmup_sol = warmup_sol
-        # Precompile so the switch does not push the cost onto the first real batch.
-        # x0 was donated by the warmup call above, hence a fresh array here.
-        self.run.trace(jnp.zeros(shape, dtype), fixed_vars, weights).lower().compile()
-        logger.info(f"Recompile Complete {time() - t0}")
+                def solve(x: Array, fixed_vars: Array, weights: tuple[Array, ...]) -> tuple[Array, Array]:
+                    x_opt, state = pgd.run(x, fixed_vars=fixed_vars, weights=weights, hyperparams_proj=(-1, 1))
+                    return x_opt, state.iter_num
+
+            def opt(x: Array, fixed_vars: Array, weights: tuple[Array, ...]):
+                x_opt, iters = solve(x, fixed_vars, weights)
+                final_cost, eval_aux = evaluator(x_opt, fixed_vars, weights)
+                x_eval = eval_aux[0]
+                final_aux: Any = (x_eval, final_cost)
+                unsat = jnp.squeeze(verifier(x_eval))
+                return x_eval, jnp.atleast_1d(unsat), jnp.atleast_1d(iters), final_aux
+
+            def vectorise(xs: Array, fixed_vars: Array, weights: tuple[Array, ...]):
+                x_opt, unsat, iters, evals = jax.vmap(opt, in_axes=(0, 0, None))(xs, fixed_vars, weights)
+                unsat_cl_count = jnp.sum(jnp.atleast_2d(unsat), axis=1)
+                return x_opt, jnp.atleast_2d(unsat), iters, unsat_cl_count, evals
+
+            self._kernels[loops] = jax.jit(vectorise, donate_argnums=(0))
+            logger.info(f"Loop strategy: outer {'unrolled' if outer else 'rolled'}, "
+                        f"line search {'unrolled' if line_search else 'rolled'}")
+        return self._kernels[loops]
+
+    def _loops_for(self, xs: Array) -> tuple[bool, bool]:
+        """Loop strategy for a batch, from its points per device (solvers/loop_control.py)."""
+        n_devices = getattr(getattr(xs, "sharding", None), "num_devices", 1)
+        outer, line_search = choose_loops(self.algo, xs.shape[0] // max(n_devices, 1))
+        return outer or bool(self.unroll), line_search
+
+    def run(self, xs: Array, fixed_vars: Array, weights: tuple[Array, ...]) -> tuple[Array, Array, Array, Array, Array]:
+        """Optimise a batch (lbfgsb/pgd). Other algorithms assign `self.run` in __init__, which shadows this."""
+        return self._kernel(self._loops_for(xs))(xs, fixed_vars, weights)
 
     def warmup(self, warmup_data: tuple[Array, Array, tuple[Array, ...]], counting: bool = False) -> None:
         if warmup_data:
             runner = self.run if self.algo not in ["sp-lbfgsb"] else self.eval_fun
             x0, fixed_vars, weights = warmup_data
-            # Captured before the call: donate_argnums=(0) invalidates x0.
-            x0_spec = (x0.shape, x0.dtype)
             logger.info("Warmup Run (Dummy Data Compilation)")
             t0 = time()
-            opt_x0, opt_unsat, opt_iters, _, _ = runner(x0, fixed_vars, weights)
+            opt_x0, opt_unsat, _, _, _ = runner(x0, fixed_vars, weights)
             if not counting:
                 batch_unsat_scores = jnp.sum(opt_unsat, axis=1)
                 batch_best = jnp.min(batch_unsat_scores)
@@ -540,9 +524,3 @@ class Optimiser(abc.ABC):
                     self.warmup_sol = True
 
             logger.info(f"Warmup Complete {time() - t0}")
-
-            # Warmup solved the real instance, so its iteration counts say which
-            # loop strategy the rest of this job wants. Pointless if warmup already
-            # found a solution.
-            if not self.warmup_sol:
-                self._retune_unroll(opt_iters, x0_spec, fixed_vars, weights)

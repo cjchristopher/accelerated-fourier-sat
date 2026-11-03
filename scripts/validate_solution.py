@@ -78,7 +78,7 @@ def parse_solution(solution_str: str, formula: PBSATFormula) -> NDArray:
 
     # Assignment array: -1 means satisfied (literal matches), +1 means unsatisfied
     # This matches the convention used in afsat where sign * x[lits] < 0 means satisfied
-    assignment = np.zeros(formula.n_var, dtype=np.int8)
+    assignment = np.zeros(formula.n_var) #, dtype=np.int8)
 
     for lit in lits:
         if lit == 0:

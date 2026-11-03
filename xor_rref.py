@@ -230,7 +230,9 @@ def _build_xor_rref_metadata(
     n_cols = len(xor_vars)
     reduced, inconsistent = _rref_gf2_sparse(rows, n_cols)
     if inconsistent:
-        logger.warning("XOR system is inconsistent after RREF; XOR projection is disabled")
+        # State the fact only: whether that ends the run (SAT mode) or the run continues without the
+        # projection (MaxSAT mode) is decided, and logged, by the caller.
+        logger.warning("XOR system is inconsistent after RREF: no assignment satisfies every XOR clause")
         return None, {}, True
 
     xor_vars_np = np.array(xor_vars, dtype=np.int32)
