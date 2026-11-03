@@ -1,0 +1,68 @@
+cff-version: 1.2.0
+title: >-
+  Accelerated Fourier SAT (AFSAT): Fast (GPU Accelerated) Fourier-SAT Solver
+message: >-
+  If you use AFSAT in your research, please cite it using the metadata from this file.
+type: software
+authors:
+  - family-names: Christopher
+    given-names: Cody
+  - family-names: Gretton
+    given-names: Charles
+identifiers:
+  - type: doi
+    value: 10.0000/afsat-concept
+    description: >-
+      Concept DOI for the software artifact (optional; fill when minted).
+  - type: doi
+    value: 10.0000/afsat-v1.0.0
+    description: >-
+      Version-specific DOI for v1.0.0 (optional; fill when minted).
+repository-code: 'https://github.com/cjchristopher/accelerated-fourier-sat'
+url: 'https://github.com/cjchristopher/accelerated-fourier-sat'
+abstract: >-
+  AFSAT is a native pseudo-Boolean Continuous Local Search SAT solver built on JAX for high-performance accelerators.
+keywords:
+  - satisfiability
+  - SAT
+  - pseudo-Boolean SAT
+  - continuous local search
+  - non-convex optimisation
+  - combinatorial optimisation
+  - GPU acceleration
+license:
+  - Apache-2.0
+  - GPL-2.0-or-later
+date-released: '2026-06-20'
+preferred-citation:
+  type: conference-paper
+  authors:
+    - family-names: Christopher
+      given-names: Cody
+    - family-names: Gretton
+      given-names: Charles
+  title: >-
+    Accelerated Fourier SAT: Fully Realising a GPU-based Symmetric Pseudo-Boolean SAT Solver
+  year: 2026
+  status: submitted
+  # url: "https://arxiv.org/abs/TBD"
+  # collection-title: "Some Conference Name"
+  # doi: "TBD"
+  # pages: "TBD"
+  # publisher: "TBD"
+references:
+  - type: conference-paper
+    authors:
+      - family-names: Christopher
+        given-names: Cody
+      - family-names: Gretton
+        given-names: Charles
+    title: A Study of Parallel Continuous Local Search
+    year: 2026
+    status: submitted
+    # url: "https://arxiv.org/abs/TBD"
+
+    # collection-title: "Some Conference Name"
+    # doi: "TBD"
+    # pages: "TBD"
+    # publisher: "TBD"
