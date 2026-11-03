@@ -406,19 +406,19 @@ class Optimiser(abc.ABC):
             self.eval_fun = v_eval_fun
 
             def full_vectorise(
-                x: Array, fixed_vars: Array, weights: tuple[Array, ...]
+                xs: Array, fixed_vars: Array, weights: tuple[Array, ...]
             ) -> tuple[Array, Array, Array, Array, Array]:
                 def flat(np_x0: NDArray) -> tuple[float, NDArray]:
                     # Convert back to JAX arrays, run on GPU, return CPU results to minimize.
-                    x0 = jnp.array(np_x0).reshape(x.shape)
+                    x0 = jnp.array(np_x0).reshape(xs.shape)
                     v, g = v_eval_fun(x0, fixed_vars, weights)  # this is eval.
                     return float(jnp.sum(v)), np.array(g.flatten())
 
-                x0 = np.array(x.flatten())
+                x0 = np.array(xs.flatten())
                 bounds = Bounds(-1, 1, True)
                 options = {"maxiter": self.maxiter}
                 res: OptimizeResult = ScipyMinimize(flat, x0, bounds=bounds, jac=True, tol=tol, options=options)
-                x_opt = jnp.array(res.x).reshape(x.shape)
+                x_opt = jnp.array(res.x).reshape(xs.shape)
                 _, eval_aux = evaluator(x_opt, fixed_vars, weights)
                 x_eval = eval_aux[0]
                 unsat = jnp.squeeze(v_verifier(x_eval))
@@ -430,16 +430,26 @@ class Optimiser(abc.ABC):
         else:
             pass
 
-    def peak_memory_estimation(self, x0: Array, fixed_vars: Array, weights: tuple[Array, ...]) -> int:
+    def compile(self, x0: Any, fixed_vars: Any, weights: tuple[Any, ...]) -> Any:
+        """Compile the batch kernel ahead of time for these shapes and shardings (arrays or ShapeDtypeStructs).
+
+        Lowered on the kernel's own jitted object, so a later call with matching arguments reuses this executable
+        instead of compiling again (lowering a fresh jax.jit wrapper around it would not). Returns the Compiled
+        object: memory_analysis() for batch sizing, out_info for compiling what consumes the kernel's outputs."""
         if self._loop_controlled:
             runner = self._kernel(self._loops_for(x0))
         else:
             runner = self.run if self.algo not in ["sp-lbfgsb"] else self.eval_fun
-        traced = runner.trace(x0, fixed_vars, weights)
-        lowered = traced.lower()
-        compiled = lowered.compile()
-        analysis = compiled.memory_analysis()
+        lower = runner.lower if hasattr(runner, "lower") else jax.jit(runner).lower
+        return lower(x0, fixed_vars, weights).compile()
 
+    def peak_memory_estimation(self, x0: Any, fixed_vars: Any, weights: tuple[Any, ...]) -> int:
+        return self.peak_bytes(self.compile(x0, fixed_vars, weights))
+
+    @staticmethod
+    def peak_bytes(compiled: Any) -> int:
+        """Peak device memory of a compiled kernel, from XLA's memory analysis."""
+        analysis = compiled.memory_analysis()
         peak_est = (
             analysis.temp_size_in_bytes  # type: ignore
             + analysis.argument_size_in_bytes  # type: ignore

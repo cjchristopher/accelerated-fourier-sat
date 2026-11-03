@@ -60,7 +60,7 @@ jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
 jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
 # jax.config.update("jax_persistent_cache_enable_xla_caches", "all")
 # # DEBUGGING BLOCK
-jax.config.update("jax_debug_nans", True)
+# jax_debug_nans is set from --debug_nans (off by default: it checks every computation's outputs on the host).
 # jax.config.update("jax_debug_infs", True)
 # jax.config.update("jax_log_compiles", True)
 # jax.config.update("jax_no_tracing", True)
@@ -83,7 +83,6 @@ from solvers import Optimiser, build_eval_verify, drop_projected_xor_evaluators,
 from utils import (
     LOG_LEVELS,
     AFSATConfig,
-    get_gpu_l2_cache_size,
 )
 from propagation import propagate_units
 from var_mapper import VarMapper
@@ -162,20 +161,37 @@ def get_mesh(devices: list) -> tuple[Mesh, NamedSharding, NamedSharding]:
     return mesh, obj_sharding, batch_sharding
 
 
-def adjust_batch(devices: list, batch: int, target: int, est_mem_per_point: int, n_prefix: int = 1) -> int:
-    n_device = len(devices)
-    # max_gpu_mem = devices[0].memory_stats()["bytes_limit"]
-    # max_batch = int((max_gpu_mem * 0.9) // est_mem_per_point)
-    # opt_batch = int((max_gpu_mem * 0.01) // est_mem_per_point)
-    max_batch = int((target) // est_mem_per_point)
-    opt_batch = int((target * 0.9) // est_mem_per_point)
+# Batch sizing. Throughput is set by giving the GPU enough work, not by fitting a cache: on a V100
+# and an RTX 2000 Ada (SHA-1 r20/r80, scripts/batch_sweep.py) per-point cost kept falling well
+# past L2. Small problems need many points to fill the GPU, so they are sized by a share of device
+# memory -- the 0.1-1% band where the AFSAT paper measured peak throughput. Large problems fill it
+# with few points, and bigger batches then mostly pay for the vmapped line search waiting on the
+# batch's worst point, so they get a fixed floor. An opt-in measured calibration is a possible
+# future upgrade (claude_scratch/14_phase1_prefix_rref_plan.md).
+BATCH_FILL_FRAC = 0.0025  # small problems: enough points to fill 0.25% of device memory
+BATCH_FLOOR = 16  # large problems: points per device
+BATCH_MEM_CAP_FRAC = 0.5  # never plan on more than half of device memory
 
-    if batch == -1 or batch > max_batch:
-        logger.info("Adjusting per-device batch size (either none specified to batch too large):")
-        logger.info(f"Set to {opt_batch} p.d. (tot. {opt_batch * n_device}) from {batch} (theoretical max {max_batch})")
-        batch = opt_batch * n_device
-    else:
-        batch = batch * n_device
+
+def heuristic_batch_per_device(device, mem_per_point: int) -> tuple[int, int | None]:
+    """(chosen, memory cap) points per device, given the estimated peak memory of one point."""
+    mem_limit = (device.memory_stats() or {}).get("bytes_limit")
+    if not mem_limit:
+        return BATCH_FLOOR, None  # no memory stats (e.g. CPU): nothing to scale by
+    mem_per_point = max(int(mem_per_point), 1)
+    cap = max(int(BATCH_MEM_CAP_FRAC * mem_limit) // mem_per_point, 1)
+    fill = math.ceil(BATCH_FILL_FRAC * mem_limit / mem_per_point)
+    return min(max(BATCH_FLOOR, fill), cap), cap
+
+
+def adjust_batch(devices: list, batch: int, max_batch: int | None = None, n_prefix: int = 1) -> int:
+    """Total batch from a per-device size: capped by memory if known, aligned to devices and prefixes."""
+    n_device = len(devices)
+    if max_batch is not None and batch > max_batch:
+        logger.warning(f"Batch of {batch} p.d. exceeds the memory cap of {max_batch} p.d.; using the cap")
+        batch = max_batch
+    logger.info(f"Set to {batch} p.d. (tot. {batch * n_device})")
+    batch = batch * n_device
 
     # Adjust alignment.
     alignment = math.lcm(n_prefix, n_device)
@@ -193,6 +209,64 @@ def adjust_batch(devices: list, batch: int, target: int, est_mem_per_point: int,
     return opt_batch
 
 
+def make_batch_programs(
+    batch: int,
+    n_vars: int,
+    sample_method: str,
+    ffsat_seed: bool,
+    reweight: bool,
+    weight_decay: float,
+    weights: tuple[Array, ...],
+    batch_sharding: NamedSharding,
+) -> tuple[Callable, Callable, Callable]:
+    """The main loop's per-batch work around the descent, as compiled programs: (draw, summarise, reweight).
+
+    draw(state, prefixes) -> (state, x0, fixed, positives): the next batch's starting points, sharded over the batch
+        like the kernel's inputs, and the sampler state for the batch after. --ffseed seeds batch k with PRNGKey(k), as
+        FastFourierSAT does; otherwise a split chain. jax's partitionable threefry gives the same points whatever
+        the sharding.
+    summarise(x_opt, unsat, unsat_ct, penalty) -> (count, index, x, unsatisfied clauses, penalty): the batch's best
+        point, and the reweighting penalty with this batch's unsatisfied counts per clause added. Reductions over the
+        sharded batch axis become cross-device reductions; the outputs are replicated, so every device (and, with
+        multiple hosts, every process) holds the whole result and can read it.
+    reweight(weights, penalty) -> (weights, penalty): each clause weight moved towards its share of the penalty
+        (worst clause = 1), with the weights' shardings unchanged, so the kernel never sees a new argument type; the
+        penalty reset.
+    """
+    replicated = NamedSharding(batch_sharding.mesh, jax.P())
+    w_sizes = tuple(int(w.shape[0]) for w in weights)
+    w_shardings = tuple(w.sharding for w in weights)
+    bounds = np.cumsum((0,) + w_sizes)
+
+    def _draw(state, prefixes):
+        if ffsat_seed:
+            s_key, state = jax.random.PRNGKey(state), state + 1
+        else:
+            state, s_key = jax.random.split(state)
+        x0, fixed = sample_assignments(s_key, batch, n_vars, sample_method, prefixes)
+        return state, x0, fixed, jnp.sum(x0 > 0, axis=1)
+
+    def _summarise(x_opt, unsat, unsat_ct, penalty):
+        loc = jnp.argmin(unsat_ct)
+        if reweight:
+            penalty = penalty + jnp.sum(unsat, axis=0)
+        return unsat_ct[loc], loc, x_opt[loc], unsat[loc], penalty
+
+    def _reweight(weights, penalty):
+        worst = jnp.max(penalty)
+        safe = jnp.where(worst > 0, worst, 1)
+        new = tuple(
+            jnp.where(worst > 0, weight_decay * w + (1 - weight_decay) * penalty[a:b] / safe, w)
+            for w, a, b in zip(weights, bounds[:-1], bounds[1:])
+        )
+        return new, jnp.zeros_like(penalty)
+
+    draw = jax.jit(_draw, out_shardings=(replicated, batch_sharding, batch_sharding, batch_sharding))
+    summarise = jax.jit(_summarise, out_shardings=replicated)
+    reweight_weights = jax.jit(_reweight, out_shardings=(w_shardings, replicated))
+    return draw, summarise, reweight_weights
+
+
 def pin_warmup_inputs(x: Array, prefix_vectors: Array | None) -> tuple[Array, Array]:
     """Apply the run's prefixes to warmup data, exactly as sample_assignments does for real batches.
 
@@ -200,8 +274,7 @@ def pin_warmup_inputs(x: Array, prefix_vectors: Array | None) -> tuple[Array, Ar
     clauses exist only as the prefix (the loader strips them from the clause arrays), so an
     unpinned warmup can "solve" the instance while violating them. And cost: sample_assignments
     returns a (batch, n_vars) mask whenever prefixes exist, so a (batch, 1) warmup mask compiles a
-    different program and the first real batch recompiles -- also leaving the unroll retune
-    tuned to a program that is never run.
+    different program and the first real batch recompiles.
     """
     if prefix_vectors is None:
         return x, jnp.full((x.shape[0], 1), fill_value=False, dtype=bool)
@@ -323,7 +396,7 @@ def prepare_problem(
             if not maxsatish_mode:
                 print("s UNSATISFIABLE")
                 raise UnsatError("XOR subsystem is inconsistent under preprocessing")
-            logger.warning("XOR preprocessing found a conflict; continuing without XOR projection")
+            logger.warning("MaxSAT mode: continuing without XOR projection despite the inconsistent XOR system")
         else:
             if xor_result.derived:
                 # Propagation implied further literals. They must reach fixed_vars/x0, and
@@ -422,28 +495,12 @@ def create_worker_session(
 
     batch = runtime_afsat.batch_per_device
     guess_batch = 0
+    mem_cap = None
     if batch == -1:
         trace("batch=-1 entering heuristic sizing")
         logger.info("Guessing optimal batch size")
-        l2_cache_size = get_gpu_l2_cache_size(devices[0])
-        if l2_cache_size is not None:
-            gpu_mem_target = int(l2_cache_size * 0.95) * n_devices * 2
-            logger.info(f"Targeting L2 cache: {l2_cache_size / (1024 * 1024):.1f} MB per GPU")
-        else:
-            gpu_mem_target = devices[0].memory_stats()["bytes_limit"] * 0.01
-            logger.info("Cache size unknown, using 1% VRAM heuristic")
-        dtype_sz = jnp.dtype(sharded_objs[0].ffts.dft.dtype).itemsize
-        all_obj_sz = sum(
-            [np.prod([max(o.clauses.lits.shape), max(o.ffts.dft.shape) ** 2, dtype_sz]) for o in sharded_objs]
-        )
-        if xor_rref_meta is not None:
-            # Bytes, like the objective term above -- this previously added an element count.
-            all_obj_sz += sum(int(a.nbytes) for a in (xor_rref_meta.row_vars, xor_rref_meta.row_mask))
-        guess_batch = int(np.floor(gpu_mem_target / all_obj_sz)) * n_devices
-        guess_batch -= guess_batch % n_devices
-        guess_batch = max(guess_batch, n_devices)
-        trace(f"heuristic guess_batch={guess_batch}")
-
+        # Estimate per-point memory by compiling at the floor size (analysed, never executed).
+        guess_batch = BATCH_FLOOR * n_devices
         trace("materializing x_guess")
         x_guess, empty_prefix = pin_warmup_inputs(
             jax.random.uniform(key, minval=0.99 - (5e-2), maxval=0.99, shape=(guess_batch, n_vars)),
@@ -453,16 +510,16 @@ def create_worker_session(
         empty_prefix = jax.device_put(empty_prefix, batch_sharding)
         w_guess = tuple((w - 1e-4) for w in weights)
         trace("estimating peak memory")
+        # memory_analysis() describes the per-device program, so divide by points per device.
         peak_mem = solver.peak_memory_estimation(x_guess, empty_prefix, w_guess)
-        mem_est_per_point = peak_mem // guess_batch
-        trace(f"peak memory estimated per_point={mem_est_per_point}")
+        mem_est_per_point = peak_mem // BATCH_FLOOR
+        batch, mem_cap = heuristic_batch_per_device(devices[0], mem_est_per_point)
+        trace(f"peak memory estimated per_point={mem_est_per_point} cap={mem_cap}")
     else:
-        mem_est_per_point = 1
-        gpu_mem_target = devices[0].memory_stats()["bytes_limit"]
         trace(f"fixed batch mode batch={batch}")
 
     trace("adjusting final batch")
-    batch = adjust_batch(devices, batch, gpu_mem_target, mem_est_per_point, prefix_count)
+    batch = adjust_batch(devices, batch, mem_cap, prefix_count)
     trace(f"adjusted batch={batch}")
     warmup_found_solution = False
 
@@ -478,11 +535,10 @@ def create_worker_session(
             empty_prefix = jax.device_put(empty_prefix, batch_sharding)
         trace("estimating warmup peak memory")
         peak_mem = int(solver.peak_memory_estimation(x_guess, empty_prefix, weights))
-        target_bytes = max(int(gpu_mem_target), 1)
-        peak_frac = peak_mem / target_bytes
+        mem_limit = (devices[0].memory_stats() or {}).get("bytes_limit") or 1
         logger.info(
-            f"Warmup: shape - {x_guess.shape[0]}, peak memory - {peak_mem}, peak/point - {peak_mem // batch}, "
-            + f"target - {target_bytes}, frac-target - {peak_frac:.3f}"
+            f"Warmup: shape - {x_guess.shape[0]}, peak memory p.d. - {peak_mem}, "
+            + f"peak/point - {peak_mem // (batch // n_devices)}, frac of device memory - {peak_mem / mem_limit:.4f}"
         )
         trace("starting warmup")
         warmup_stop = threading.Event()
@@ -697,93 +753,78 @@ def run_solver(
     f_key = jax.random.PRNGKey(np.array(seed + 1))
 
     guess_batch = 0
+    mem_cap = None
     if batch == -1:
         logger.info("Guessing optimal batch size")
-        # Optimal throughput is achieved when working set fits in the GPU L2 cache.
-        # Fall back to 1% of VRAM if cache size is unavailable.
-        l2_cache_size = get_gpu_l2_cache_size(devices[0])
-        if l2_cache_size is not None:
-            # Target ~95% of detected cache budget to leave room for other data
-            gpu_mem_target = int(l2_cache_size * 0.95) * n_devices * 2
-            logger.info(f"Targeting L2 cache: {l2_cache_size / (1024 * 1024):.1f} MB per GPU")
-
-        else:
-            ### Dead branch for now - the above call builds in a sensible default.
-            # Fallback: 1% of VRAM heuristic
-            gpu_mem_target = devices[0].memory_stats()["bytes_limit"] * 0.01
-            logger.info("Cache size unknown, using 1% VRAM heuristic")
-        dtype_sz = jnp.dtype(objs[0].ffts.dft.dtype).itemsize
-        all_obj_sz = sum([np.prod([max(o.clauses.lits.shape), max(o.ffts.dft.shape) ** 2, dtype_sz]) for o in objs])
-        if xor_rref_meta is not None:
-            # Bytes, like the objective term above -- this previously added an element count.
-            all_obj_sz += sum(int(a.nbytes) for a in (xor_rref_meta.row_vars, xor_rref_meta.row_mask))
-        guess_batch = int(np.floor(gpu_mem_target / (all_obj_sz))) * n_devices
-        guess_batch -= guess_batch % n_devices
-        guess_batch = max(guess_batch, n_devices)  # Ensure at least 1 per device
-        logger.info(f"Initial batch size guess: {guess_batch}")
-
+        # Estimate per-point memory by compiling at the floor size (analysed, never executed).
+        guess_batch = BATCH_FLOOR * n_devices
         x_guess, empty_prefix = pin_warmup_inputs(
             jax.random.uniform(key, minval=0.99 - (5e-2), maxval=0.99, shape=(guess_batch, n_vars)), prefix_vectors
         )
         x_guess = jax.device_put(x_guess, batch_sharding)
         empty_prefix = jax.device_put(empty_prefix, batch_sharding)
         w_guess = tuple((w - 1e-4) for w in weights)
+        # memory_analysis() describes the per-device program, so divide by points per device.
         peak_mem = solver.peak_memory_estimation(x_guess, empty_prefix, w_guess)
-        mem_est_per_point = peak_mem // guess_batch
-        logger.info(f"Initial batch size guess mem/point: {mem_est_per_point}")
-    else:
-        mem_est_per_point = 1
-        gpu_mem_target = devices[0].memory_stats()["bytes_limit"]
+        mem_est_per_point = peak_mem // BATCH_FLOOR
+        batch, mem_cap = heuristic_batch_per_device(devices[0], mem_est_per_point)
+        logger.info(f"Estimated peak memory per point: {mem_est_per_point}; memory cap {mem_cap} p.d.")
 
-    batch = adjust_batch(devices, batch, gpu_mem_target, mem_est_per_point, n_prefix)
+    batch = adjust_batch(devices, batch, mem_cap, n_prefix)
+
+    # The per-batch work around the descent is one compiled program each (make_batch_programs), compiled at warm-up
+    # below. The main loop then runs no one-off array operations (each would compile on first use, inside the timer)
+    # and moves two scalars to the host per batch. --stats adds the per-descent statistics and anomaly checks; the
+    # progress display draws on them.
+    stats = output_cfg.stats or not benchmark
+    reweight = bool(restart_thresh)
+    draw, summarise, reweight_weights = make_batch_programs(
+        batch, n_vars, sample_method, ffsat_seed, reweight, weight_decay, weights, batch_sharding
+    )
+    # Placed as the programs return them (replicated), so the first call and every later one share one argument type.
+    replicated = NamedSharding(mesh, jax.P())
+    sampler_state = jax.device_put(jnp.asarray(0, dtype=jnp.int64) if ffsat_seed else key, replicated)
+    penalty = jax.device_put(jnp.zeros((sum(int(w.shape[0]) for w in weights),), dtype=jnp.int64), replicated)
 
     if warmup:
-        if guess_batch != batch:
-            # Size changed, so we need new arrays for warmup
-            x_guess, empty_prefix = pin_warmup_inputs(
-                jax.random.uniform(f_key, minval=0.99 - (5e-2), maxval=0.99, shape=(batch, n_vars)), prefix_vectors
-            )
-            x_guess = jax.device_put(x_guess, batch_sharding)
-            empty_prefix = jax.device_put(empty_prefix, batch_sharding)
+        # Warm-up is compilation ahead of time, with no dummy descent: the sampler, the batch kernel and the
+        # bookkeeping, each lowered on its own jitted object for the real batches' shapes and shardings (taken from
+        # the output of the program before it), so the first real batch reuses all three and the timer holds no
+        # compilation. The kernel's compile also gives X-PEAK. Without -w they compile in the first batch instead.
+        logger.info("Warmup (ahead-of-time compilation)")
+        warm_start = time()
+        _, x_spec, fixed_spec, _ = draw.lower(sampler_state, prefix_vectors).compile().out_info
+        kernel = solver.compile(x_spec, fixed_spec, weights)
+        out = kernel.out_info  # x_opt, unsat, iters, unsat_ct, aux
+        if len(out) == 5:
+            penalty_spec = summarise.lower(out[0], out[1], out[3], penalty).compile().out_info[-1]
+            if reweight:
+                reweight_weights.lower(weights, penalty_spec).compile()
+        logger.info(f"Warmup Complete {time() - warm_start}")
 
         if not benchmark and logger.isEnabledFor(logging.INFO):
             if mesh.shape["batch"] > 1:
                 logger.info("Batch sharding:")
-                jax.debug.visualize_array_sharding(x_guess)
+                jax.debug.visualize_sharding(x_spec.shape, x_spec.sharding)
             if mesh.shape["objective"] > 1:
                 logger.info("Objective sharding:")
                 jax.debug.visualize_array_sharding(objs[0].clauses.lits)
 
-        peak_mem = solver.peak_memory_estimation(x_guess, empty_prefix, weights)
-        mem_est_per_point = peak_mem // batch
-        target_bytes = max(int(gpu_mem_target), 1)
-        peak_frac = float(peak_mem) / target_bytes
+        peak_mem = solver.peak_bytes(kernel)
+        mem_est_per_point = peak_mem // batch  # X-PEAKPP keeps its historical definition
+        mem_limit = (devices[0].memory_stats() or {}).get("bytes_limit") or 1
         logger.info(
-            f"Warmup: shape - {x_guess.shape[0]}, peak memory - {peak_mem}, peak/point - {mem_est_per_point}, "
-            + f"target - {target_bytes}, frac-target - {peak_frac:.3f}"
+            f"Warmup: shape - {x_spec.shape[0]}, peak memory p.d. - {peak_mem}, "
+            + f"peak/point - {peak_mem // (batch // n_devices)}, frac of device memory - {peak_mem / mem_limit:.4f}"
         )
-
-        warm_start = time()
-        solver.warmup((x_guess, empty_prefix, weights), bool(counting))
-        warm_end = time()
-        if not counting and solver.warmup_sol:
-            # Found a solution during warmup. Report it in the standard form and exit.
-            signed = tuple(np.sign(np.asarray(solver.warmup_x)).astype(int).tolist())
-            print("s SATISFIABLE")
-            print(f"v {var_mapper.assn_str(signed, binary_v)} 0")
-            logger.info(f"W-TTFS {warm_end - warm_start}")
-            logger.info(f"W-XT {warm_end - warm_start}")
-            return warm_end - warm_start
 
     all_sols: dict[tuple[int, ...], int] = defaultdict(int)
     first_sol: tuple[int, ...] | None = None
-    best_x = np.zeros(n_vars)
+    best_x_dev = best_row_dev = None  # the best point so far and its unsatisfied clauses, kept on the device
     ttfs = 0
-    best_unsat = jnp.inf
-    best_unsat_clauses_idx = np.array([0])
+    best_unsat = math.inf
     batches_done = 0
     restart_ct = 0
-    restart_unsats = []
     all_unsats = []
     all_iters = []
     all_evals = []
@@ -815,31 +856,16 @@ def run_solver(
         start_batch = time()
         tloop = time()
 
-        # Randomisation & Init
-        if ffsat_seed:
-            key = jax.random.PRNGKey(batches_done)
-            s_key = key
-        else:
-            key, s_key = jax.random.split(key)
-        f_key, s_f_key = jax.random.split(f_key)
-        x0, fixed_vars = sample_assignments(s_key, batch, n_vars, sample_method, prefix_vectors)
-        x0_dev = jax.device_put(x0.copy(), batch_sharding)
-        fixed_vars = jax.device_put(fixed_vars, batch_sharding)
-
-        # if logger.isEnabledFor(logging.WARNING) and batches_done < 5:
-        #     print(f"c Initial Assigment (batch {batches_done}, point 0)", np.asarray(x0[0,:].copy().tolist()))
-
-        # Run solver.
-        opt_x0, opt_unsat, opt_iters, opt_unsat_ct, aux_info = solver.run(x0_dev, fixed_vars, weights)
+        # Sample, descend (x0 is donated to the solver), and pick the batch's best point; the only transfer to the
+        # host is the best point's unsatisfied count and index.
+        sampler_state, x0, fixed_vars, x0_positive = draw(sampler_state, prefix_vectors)
+        opt_x0, opt_unsat, opt_iters, opt_unsat_ct, aux_info = solver.run(x0, fixed_vars, weights)
+        b_unsat, b_loc, b_x, b_row, penalty = summarise(opt_x0, opt_unsat, opt_unsat_ct, penalty)
+        batch_best_unsat, batch_best_loc = (int(v) for v in jax.device_get((b_unsat, b_loc)))
         accum_time_descent += time() - tloop
 
-        # if logger.isEnabledFor(logging.WARNING) and batches_done < 5:
-        #     print(f"c Final Assigment (batch {batches_done}, point 0)", np.asarray(opt_x0[0,:].copy().tolist()))
-        #     print("c DIFFERENT?", not all((x0[0,:] == opt_x0[0,:]).tolist()))
-        # print(aux_info)
-
         # Flag and bail if we encounter anomalous behaviour
-        if logger.isEnabledFor(logging.WARNING):
+        if stats and logger.isEnabledFor(logging.WARNING):
             eval_last = np.abs(np.asarray(aux_info[-1]))
             eval_oob = (eval_last > n_clause) & (~np.isclose(eval_last, float(n_clause)))
             if np.any(eval_oob):
@@ -870,20 +896,8 @@ def run_solver(
                 if QUIT_ON_ANOMALY:
                     return 0.0
 
-        flips = (opt_x0 > 0).sum(axis=1) - (x0 > 0).sum(axis=1)
-
-        # first argument is the second to last value x had in the descent
-        _, eval_scores = aux_info
-        eval_scores = jnp.array(eval_scores).squeeze().T
-
-        batch_best_loc = jnp.argmin(opt_unsat_ct)
-        batch_best_unsat = jnp.take(opt_unsat_ct, batch_best_loc)
-        batch_best_x = opt_x0[batch_best_loc]
-        batch_best_unsat_clauses_idx = jnp.nonzero(opt_unsat[batch_best_loc])
         if batch_best_unsat < best_unsat:
-            best_x = np.asarray(batch_best_x).copy()
-            best_unsat = np.asarray(batch_best_unsat).copy()
-            best_unsat_clauses_idx = np.asarray(batch_best_unsat_clauses_idx).copy()
+            best_unsat, best_x_dev, best_row_dev = batch_best_unsat, b_x, b_row
 
         tbatch = time()
         found_sol = False
@@ -891,13 +905,11 @@ def run_solver(
         if unsat_h and batch_best_unsat <= unsat_h:
             ttfs = time() - t0
             found_sol = True
-            opt_iters_local = np.array(opt_iters.flatten()).tolist()
             batches_done += 1
             end_batch = time()
             break
 
         if batch_best_unsat == 0:
-            best_x = np.asarray(batch_best_x).copy()
             if ttfs == 0:
                 ttfs = tbatch - t0
             found_sol = True
@@ -907,7 +919,7 @@ def run_solver(
             fuzz_attempt = 0
             F_x = opt_x0[:]
             f_key, s_f_key = jax.random.split(f_key)
-            fuzz = jax.random.uniform(s_f_key, minval=1e-7, maxval=1e-2, shape=x0.shape)
+            fuzz = jax.random.uniform(s_f_key, minval=1e-7, maxval=1e-2, shape=opt_x0.shape)
             fuzz_mag = 1
             while fuzz_attempt < fuzz_limit:
                 fuzz_mask = np.ones(F_x.shape, dtype=bool)
@@ -923,25 +935,24 @@ def run_solver(
 
                 # Project back on to hypercube.
                 F_x = jnp.clip(jnp.where(fuzz_mask, F_x + fuzz_adj, F_x), -1, 1)
+                F_x_sign = jnp.sign(F_x)  # F_x is donated to the solver below
 
                 F_opt_x, F_opt_unsat, F_opt_iters, F_opt_unsat_ct, (_, F_eval_scores) = solver.run(
                     F_x, fixed_vars, weights
                 )
 
-                F_batch_best_loc = jnp.argmin(F_opt_unsat_ct)
-                F_batch_best_unsat = jnp.take(F_opt_unsat_ct, F_batch_best_loc)
-                F_batch_best_x = opt_x0[F_batch_best_loc]
-                F_batch_best_unsat_clauses_idx = jnp.nonzero(opt_unsat[F_batch_best_loc])
+                F_unsat, F_loc, F_x_best, F_row, _ = summarise(F_opt_x, F_opt_unsat, F_opt_unsat_ct, penalty)
+                F_batch_best_unsat, F_batch_best_loc = (int(v) for v in jax.device_get((F_unsat, F_loc)))
                 if F_batch_best_unsat < best_unsat:
                     # TODO: We make a (spurious?) assumption that bumping a solution will find that solution again
                     # So this check needs to be adjusted to also check the number the solutions and replace only if
                     # find more - this covers both the counting and not counting case.
                     # TODO: This would also subsume the next check somewhat - since found_sol would already be true.
-                    # We beat the unfuzzed convergence, so keep this result instead.
-                    best_x = np.asarray(F_batch_best_x).copy()
-                    best_unsat = np.asarray(F_batch_best_unsat).copy()
-                    best_unsat_clauses_idx = np.asarray(F_batch_best_unsat_clauses_idx).copy()
-                    opt_x0, opt_unsat, opt_iters, opt_unsat_ct = F_x, F_opt_unsat, F_opt_iters, F_opt_unsat_ct
+                    # We beat the unfuzzed convergence, so keep this result instead (the descended points, and their
+                    # best point; the earlier code kept the pre-descent points and indexed the unfuzzed batch).
+                    best_unsat, best_x_dev, best_row_dev = F_batch_best_unsat, F_x_best, F_row
+                    batch_best_unsat, batch_best_loc, b_x = F_batch_best_unsat, F_batch_best_loc, F_x_best
+                    opt_x0, opt_unsat, opt_iters, opt_unsat_ct = F_opt_x, F_opt_unsat, F_opt_iters, F_opt_unsat_ct
 
                 tfuzz = time()
                 if F_batch_best_unsat == 0:
@@ -956,7 +967,7 @@ def run_solver(
                     if not counting:
                         break
 
-                if (jnp.sign(F_x) == jnp.sign(F_opt_x)).all():
+                if (F_x_sign == jnp.sign(F_opt_x)).all():
                     # If no points ended up changing signs after convergence, we didn't move at all. Increase magnitude
                     fuzz_mag += 1
                 else:
@@ -964,25 +975,27 @@ def run_solver(
 
                 F_x = F_opt_x
 
-        opt_iters_local = np.array(opt_iters.flatten()).tolist()
         batches_done += 1
         end_batch = time()
 
-        all_unsats.extend(np.array(opt_unsat_ct.flatten()).tolist())
-        all_evals.extend(np.array(eval_scores.flatten()).tolist())
-        all_iters.extend(opt_iters_local)
-        all_flips.extend(np.array(flips.flatten()).tolist())
+        if stats:
+            opt_iters_local = np.asarray(opt_iters).flatten().tolist()
+            # first argument is the second to last value x had in the descent
+            eval_scores = jnp.array(aux_info[1]).squeeze().T
+            flips = jnp.sum(opt_x0 > 0, axis=1) - x0_positive
+            all_unsats.extend(np.asarray(opt_unsat_ct).flatten().tolist())
+            all_evals.extend(np.asarray(eval_scores).flatten().tolist())
+            all_iters.extend(opt_iters_local)
+            all_flips.extend(np.asarray(flips).flatten().tolist())
 
         if found_sol:
-            first_sol = tuple(np.sign(best_x).astype(int).tolist())
-            sol_locs: list[int] = jnp.argwhere(jnp.where(opt_unsat_ct < 1, 1, 0)).flatten().tolist()
-            batch_sols: list[tuple[int, ...]]
-            batch_sols = [tuple(row.astype(int).tolist()) for row in np.sign(np.asarray(opt_x0[sol_locs, :]))]
+            first_sol = tuple(np.sign(np.asarray(b_x)).astype(int).tolist())
             if counting:
-                for sol in batch_sols:
-                    all_sols[sol] += 1
+                sol_locs = np.flatnonzero(np.asarray(opt_unsat_ct) < 1)
+                for row in np.sign(np.asarray(opt_x0)[sol_locs, :]):
+                    all_sols[tuple(row.astype(int).tolist())] += 1
             else:
-                all_sols[tuple(np.sign(opt_x0[batch_best_loc, :]).astype(int).tolist())] += 1
+                all_sols[first_sol] += 1
                 if not benchmark:
                     # Close tqdm.
                     # TODO: We probably don't need this at all if we change tqdm usage (progress) to context manager.
@@ -996,8 +1009,8 @@ def run_solver(
                     logger.info(f"SAT! at sample {max(batches_done, 0) * batch + batch_best_loc}")
                 break
 
-        if restart_thresh:
-            restart_unsats.append(np.asarray(opt_unsat))
+        if reweight:
+            # summarise() has added this batch's unsatisfied counts per clause to the penalty.
             # TODO: There is probably some way to calculate how many restarts are needed given the batch size to get
             # enough of a sample to ensure the reweighting is meaningful. If there's 500 clauses and we are only running
             # batches of 100, we probably need restart_thresh to be more than 1, at the very least. I think? I don't
@@ -1012,26 +1025,12 @@ def run_solver(
             # as a starting point, ensuring we see roughly batch-size coverage of the clause space.
 
             if not (batches_done % restart_thresh):
-                # Gather unsat counts by clause
-                penalty = jnp.atleast_1d(jnp.concatenate(restart_unsats, axis=1).sum(axis=0))
-                if jnp.any(penalty):
-                    worst = penalty.max()
-
+                # The penalty sums the unsatisfied counts over the restart_thresh batches since the last update (the
+                # earlier code concatenated the batches along the clause axis, so above 1 it used the first batch's).
+                if logger.isEnabledFor(logging.DEBUG):
                     logger.debug(f"# Restart: {restart_ct} | Best MAX-SAT cost (#unsat): {best_unsat}")
-                    logger.debug(f"Unsat counts: {penalty}, \nBest: {best_unsat_clauses_idx}")
-
-                    pen_start = 0
-                    new_weights: list[Array] = []
-                    for weight in weights:
-                        obj_clauses = len(weight)
-                        pen_end = pen_start + obj_clauses
-                        w_pens = penalty[pen_start:pen_end]
-                        new_weight = weight_decay * weight + (1 - weight_decay) * w_pens / worst
-                        new_weights.append(new_weight)
-                        pen_start += obj_clauses
-
-                    weights = shard_tree(tuple(new_weights), obj_sharding)
-                restart_unsats = []
+                    logger.debug(f"Unsat counts: {penalty}, \nBest: {np.flatnonzero(np.asarray(best_row_dev))}")
+                weights, penalty = reweight_weights(weights, penalty)
                 restart_ct += 1
 
         if not benchmark:
@@ -1087,6 +1086,8 @@ def run_solver(
             pbar.set_postfix_str(f"({(pbelapse / batches_done):.2f}s/it)")
 
     tsolve = time() - t0
+    best_x = np.asarray(best_x_dev) if best_x_dev is not None else np.zeros(n_vars)
+    best_unsat_clauses_idx = np.flatnonzero(np.asarray(best_row_dev)) if best_row_dev is not None else np.array([0])
     if not benchmark:
         # TODO: The above todo re tqdm context would remove the need to close these.
         if len(histbars):
@@ -1178,11 +1179,12 @@ def run_solver(
             logger.info("X-UQSOLS 0")
         logger.info(f"X-RATIODESC {(batches_done * batch) / accum_time_descent} POINTS/DESCTIME")
         logger.info(f"X-RATIOLOOP {(batches_done * batch) / tsolve} POINTS/LOOPTIME")
-        logger.info(f"X-ITERHISTO {dict(Counter(all_iters))}")
-        logger.info(f"X-RAWEVAL {all_evals}")
-        logger.info(f"X-RAWUNSAT {all_unsats}")
-        logger.info(f"X-RAWITER {all_iters}")
-        logger.info(f"X-RAWFLIPS {all_flips}")
+        if stats:
+            logger.info(f"X-ITERHISTO {dict(Counter(all_iters))}")
+            logger.info(f"X-RAWEVAL {all_evals}")
+            logger.info(f"X-RAWUNSAT {all_unsats}")
+            logger.info(f"X-RAWITER {all_iters}")
+            logger.info(f"X-RAWFLIPS {all_flips}")
         logger.info("END EXP")
     return tsolve
 
@@ -1255,7 +1257,9 @@ if __name__ == "__main__":
     runtime_afsat_opts = make_option_group("Runtime AFSAT Aliases", "runtime_afsat")
     runtime_afsat_opts("-b", "--batch", type=int, field="batch_per_device", help="Batch size. -1 = heuristic maximum")
     runtime_afsat_opts("-f", "--fuzz", type=int, field="fuzz", help="Number of times to attempt fuzzing per batch")
-    runtime_afsat_opts("-w", "--warmup", action="store_true", field="warmup", help="Warmup (dummy run) kernel")
+    runtime_afsat_opts(
+        "-w", "--warmup", action="store_true", field="warmup", help="Compile the solver before the timer starts"
+    )
     runtime_afsat_opts("--xor_rref", action="store_true", field="xor_rref", help="Enable XOR GJ Elim (RREF projection)")
     runtime_afsat_opts(
         "--no_propagate", action="store_false", field="propagate", help="Disable full-formula unit propagation"
@@ -1275,11 +1279,17 @@ if __name__ == "__main__":
     output_opts("--anomaly_quit", action="store_true", field="anomaly_quit")
     output_opts("--log_propagate", action="store_true", field="log_propagate")
     output_opts("--binary_v", action="store_true", field="binary_v", help="Short form solution string")
+    output_opts(
+        "--stats", action="store_true", field="stats",
+        help="Per-descent statistics (X-RAW*, X-ITERHISTO) and anomaly checks; off = production loop",
+    )
+    output_opts("--debug_nans", action="store_true", field="debug_nans", help="Enable jax_debug_nans (slow)")
 
     parsed = ap.parse_args()
     instantiated = ap.instantiate(parsed)
     config = instantiated.config
     config.runtime_common.n_devices = config.runtime_common.n_devices or n_devices
+    jax.config.update("jax_debug_nans", config.output_logging.debug_nans)
 
     QUIT_ON_ANOMALY = config.output_logging.anomaly_quit
     # Keep module logs routed through root handlers configured below.

@@ -102,6 +102,8 @@ class OutputLoggingConfig:
     log_propagate: bool = True
     binary_v: bool = False
     anomaly_quit: bool = False
+    stats: bool = False  # per-descent statistics (X-RAW*, X-ITERHISTO) and the per-batch anomaly check
+    debug_nans: bool = False  # jax_debug_nans: check every computation's outputs for NaN (slow; debugging only)
 
 
 @dataclass
