@@ -20,16 +20,16 @@ from jsonargparse import ArgumentParser as ArgParse
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"  # Disable pre-allocation
 os.environ["XLA_CLIENT_MEM_FRACTION"] = "0.95"  # Use full memory allocation
 # os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
+# Only the scheduler and stream flags are kept. An A/B on card, sudoku, PLE and SHA-1 r20 with RREF (JAX 0.11.2)
+# showed no change in compile time, time per batch or results from the others: the GEMM flags (triton_gemm_any,
+# cublaslt, autotune_gemm_rtol, exhaustive_tiling_search) have nothing to act on, since the compiled kernels contain
+# no matrix multiplications, and fast_min_max (min/max that do not propagate NaN) and fast_math gave nothing
+# measurable, while NaN-propagating min/max keep the anomaly checks honest. The two kept flags matter only with
+# collectives (several GPUs). To A/B a flag, append to XLA_FLAGS after importing this module.
 os.environ["XLA_FLAGS"] = " ".join(  # noqa: FLY002
     [
-        "--xla_enable_fast_math=true",
-        "--xla_gpu_triton_gemm_any=true",
         "--xla_gpu_enable_latency_hiding_scheduler=true",
         "--xla_gpu_enable_highest_priority_async_stream=true",
-        "--xla_gpu_enable_fast_min_max=true",
-        "--xla_gpu_enable_cublaslt=true",
-        "--xla_gpu_autotune_gemm_rtol=1e-6",
-        "--xla_gpu_exhaustive_tiling_search=true",
         # "--xla_gpu_deterministic_ops=true",
         # "--xla_gpu_require_complete_aot_autotune_results=true",
     ]
@@ -57,6 +57,13 @@ jax.config.update("jax_compiler_enable_remat_pass", True)
 jax.config.update("jax_compilation_cache_dir", "/tmp/jax-cache")
 jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
 jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
+# The evaluators close over their clause data on purpose, and JAX is moving to new handling of closed-over constants
+# that hoists every one above this size into executable arguments (32 bytes in 0.11.2;
+# docs.jax.dev/en/latest/internals/constants.html). Keep everything embedded. Measured on JAX 0.11.2: the new handling
+# makes no difference on card, sudoku, Ramsey or SHA, but slows the all-XOR PLE kernel by 14-32% whatever this
+# threshold is. The option exists from about JAX 0.11.
+if hasattr(jax.config, "jax_embedded_constants_max_bytes"):
+    jax.config.update("jax_embedded_constants_max_bytes", 2**31 - 1)
 # jax.config.update("jax_persistent_cache_enable_xla_caches", "all")
 # # DEBUGGING BLOCK
 # jax_debug_nans is set from --debug_nans (off by default: it checks every computation's outputs on the host).
@@ -141,6 +148,12 @@ def shard_tree(target, sharding) -> tuple[object, ...]:
         return leaf
 
     return jax.tree.map(shard_leaf, target)
+
+
+def random_seed() -> int:
+    """The seed when none is given (-s -1, the default): 31 bits from the OS, so independent runs, on one node or
+    many, start from independent points. (The clock here is perf_counter, seconds since boot: too coarse a seed.)"""
+    return int.from_bytes(os.urandom(4), "little") >> 1
 
 
 def get_mesh(devices: list) -> tuple[Mesh, NamedSharding, NamedSharding]:
@@ -553,7 +566,7 @@ def create_worker_session(
                     f"capacities {fold_layout.capacities}")
     solver = build_solver(config, sharded_objs, xor_rref_meta, None, folded_xor=fold_layout is not None)
 
-    seed = int(time()) if runtime_common.rand_seed == -1 else runtime_common.rand_seed
+    seed = random_seed() if runtime_common.rand_seed == -1 else runtime_common.rand_seed
     logger.info(f"seed={seed}, rand_seed={runtime_common.rand_seed}")
     trace(f"seed initialized={seed}")
     key = jax.random.PRNGKey(np.array(seed))
@@ -812,7 +825,7 @@ def run_solver(
     # Construct pure JAX functions (closures) and build solver.
     solver = build_solver(config, objs, xor_rref_meta, prefix_vectors)
 
-    seed = int(time()) if rand_seed == -1 else rand_seed
+    seed = random_seed() if rand_seed == -1 else rand_seed
     logger.info(f"seed={seed}, rand_seed={rand_seed}")
     # logger.debug(f"seed={seed}, rand_seed={rand_seed}")
     key = jax.random.PRNGKey(np.array(seed))
