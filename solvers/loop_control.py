@@ -31,6 +31,18 @@ convergence. The replacement is the gradient mapping at the point the step was t
 points of f over the box (Beck, First-Order Methods in Optimization, SIAM 2017, ch. 10); jaxopt's non-accelerated
 update and its optimality_fun already measure this quantity. A line search that used all its trials without
 meeting sufficient decrease reports an infinite error, so it never counts as convergence.
+
+The PGD subclass also replaces jaxopt's FISTA line search (carried_fista_line_search). jaxopt evaluates the
+sufficient-decrease test, and with it the objective, in the loop condition. Under vmap, JAX evaluates a batched
+loop predicate twice per trip: in the condition, reduced over the batch, and in the body, to select the points that
+advance. XLA compiles the two copies of the objective independently, and nothing makes them round alike; on JAX
+0.11 its fusion autotuner can emit one with Triton and the other natively, with different summation orders. Where
+the projected step is zero, as at converged vertices, the test compares f(x) with itself against an absolute eps
+of 2.2e-16, so one ulp decides it. When the condition says "continue" and the body says "done", that point never
+advances and the loop never exits (PLE at tol 1e-12 hung this way, on JAX 0.11.2 and 0.12.0.1). The replacement
+evaluates the test once per trial in the body and carries it, so the condition only reads a stored flag. Trial
+points and accepted steps are unchanged, and a rolled search now evaluates the objective once per trial instead of
+twice.
 """
 
 from __future__ import annotations
@@ -43,10 +55,10 @@ from typing import Optional
 import jax
 import jax.numpy as jnp
 from jaxopt import LBFGSB, ProjectedGradient, ProximalGradient
-from jaxopt._src import base, prox
+from jaxopt._src import base, loop, prox
 from jaxopt._src.linesearch_util import _setup_linesearch
-from jaxopt._src.proximal_gradient import ProxGradState, fista_line_search
-from jaxopt._src.tree_util import tree_add_scalar_mul, tree_l2_norm, tree_single_dtype, tree_sub
+from jaxopt._src.proximal_gradient import ProxGradState
+from jaxopt._src.tree_util import tree_add_scalar_mul, tree_l2_norm, tree_single_dtype, tree_sub, tree_vdot
 
 PGD_LS_UNROLL_MIN_BATCH = 1024
 
@@ -83,10 +95,36 @@ def choose_loops(algorithm: str, points_per_device: int) -> tuple[bool, bool]:
     return False, algorithm == "pgd" and points_per_device >= PGD_LS_UNROLL_MIN_BATCH
 
 
+def carried_fista_line_search(fun, prox_grad, jit, unroll, maxls, x, x_fun_val, x_fun_grad, stepsize,
+                              decrease_factor, hyperparams_prox, args, kwargs):
+    """jaxopt's fista_line_search (same signature, trial points and accepted step) with the sufficient-decrease
+    test evaluated once per trial in the loop body and carried in the loop state; the loop condition only reads it
+    (module docstring)."""
+    eps = jnp.finfo(x_fun_val.dtype).eps
+
+    def insufficient(next_x, step):
+        diff_x = tree_sub(next_x, x)
+        fun_decrease = step * (fun(next_x, *args, **kwargs) - x_fun_val)
+        condition = step * tree_vdot(diff_x, x_fun_grad) + 0.5 * tree_l2_norm(diff_x, squared=True)
+        return fun_decrease > condition + eps
+
+    def body(state):
+        next_step = state[1] * decrease_factor
+        next_x = prox_grad(x, x_fun_grad, next_step, hyperparams_prox)
+        return next_x, next_step, insufficient(next_x, next_step)
+
+    init_x = prox_grad(x, x_fun_grad, stepsize, hyperparams_prox)
+    next_x, used, _ = loop.while_loop(
+        cond_fun=lambda state: state[2], body_fun=body, init_val=(init_x, stepsize, insufficient(init_x, stepsize)),
+        maxiter=maxls, unroll=unroll, jit=jit,
+    )
+    return next_x, used
+
+
 @dataclass(eq=False)
 class _LoopAwareProximalGradient(ProximalGradient):
-    """ProximalGradient whose FISTA line search has its own unroll flag, and which stops on the gradient mapping
-    (module docstring) unless `legacy_stop` is set."""
+    """ProximalGradient whose FISTA line search carries its test and has its own unroll flag, and which stops on
+    the gradient mapping (module docstring) unless `legacy_stop` is set."""
 
     ls_unroll: bool = False
     legacy_stop: bool = False
@@ -97,7 +135,7 @@ class _LoopAwareProximalGradient(ProximalGradient):
             fun=self.fun, value_and_grad=self.value_and_grad, has_aux=self.has_aux
         )
         fun_without_aux = lambda *a, **kw: fun_with_aux(*a, **kw)[0]
-        ls = partial(fista_line_search, fun_without_aux, self._prox_grad, self.jit, self.ls_unroll)
+        ls = partial(carried_fista_line_search, fun_without_aux, self._prox_grad, self.jit, self.ls_unroll)
         self._fista_line_search = jax.jit(ls, static_argnums=(0,)) if self.jit else ls
 
     def _update_accel(self, x, state, hyperparams_prox, args, kwargs):
