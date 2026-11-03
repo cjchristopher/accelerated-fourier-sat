@@ -341,6 +341,7 @@ class AFSATProblem:
     n_var: int
     n_clause: int
     var_mapper: VarMapper
+    n_never_sat: int = 0  # MaxSAT mode: soft clauses no assignment satisfies (not in the objectives)
 
 
 @dataclass
@@ -375,6 +376,7 @@ class AFSATWorkerSession:
     x_spec: Any
     fixed_spec: Any
     unsat_h: int
+    n_never_sat: int
     fuzz_limit: int
     counting: bool
     stats: bool
@@ -412,6 +414,11 @@ def prepare_problem(
     if not problem_file:
         raise ValueError("No problem file specified")
 
+    # MaxSAT mode (-u): every input clause is soft (the input formats cannot mark a clause hard), so the only literals
+    # that may be pinned are prefix literals, which are ground truth. Nothing is derived from the formula: no unit
+    # pins from parsing, no unit propagation, no XOR preprocessing (its derived literals and RREF projection both
+    # treat the XOR clauses as hard). Counting mode keeps hard semantics.
+    soft = bool(config.runtime_common.unsat_thresh)
     stamp1 = time()
     sat_parser = PBSATFormula(
         workers=4,
@@ -419,6 +426,7 @@ def prepare_problem(
         disk_cache=config.invocation.disk_cache,
         file=problem_file,
         compactify=False,
+        soft=soft,
     )
     stamp2 = time()
     read_time = stamp2 - stamp1
@@ -426,7 +434,12 @@ def prepare_problem(
     maxsatish_mode = bool(config.runtime_common.counting or config.runtime_common.unsat_thresh)
     objectives = sat_parser.process_clauses_to_array()
     xor_rref_meta: XorRREFMetadata | None = None
-    if config.runtime_afsat.propagate:
+    if soft:
+        logger.info(
+            "MaxSAT mode: all clauses soft; no unit propagation, XOR preprocessing or XOR RREF projection "
+            "(they would enforce soft clauses as hard)"
+        )
+    if config.runtime_afsat.propagate and not soft:
         prop1 = time()
         propagated = propagate_units(sat_parser.clause_sets, sat_parser.unit_prefix)
         logger.info(f"X-PROPTIME {time() - prop1}")
@@ -448,7 +461,7 @@ def prepare_problem(
     # runs whenever there are XOR clauses. Only the second tier -- dependents the reduction
     # forces outright, which need a linear combination of clauses to expose -- is gated on
     # the RREF actually being built.
-    if sat_parser.xor_clause_sets:
+    if sat_parser.xor_clause_sets and not soft:
         xor1 = time()
         xor_result = preprocess_xor_system(
             sat_parser.xor_clause_sets,
@@ -463,7 +476,7 @@ def prepare_problem(
             if not maxsatish_mode:
                 print("s UNSATISFIABLE")
                 raise UnsatError("XOR subsystem is inconsistent under preprocessing")
-            logger.warning("XOR preprocessing found a conflict; continuing without XOR projection")
+            logger.warning("MaxSAT mode: continuing without XOR projection despite the inconsistent XOR system")
         else:
             if xor_result.derived:
                 # Propagation implied further literals. They must reach fixed_vars/x0, and
@@ -496,6 +509,7 @@ def prepare_problem(
         n_var=sat_parser.n_var,
         n_clause=sat_parser.n_clause,
         var_mapper=sat_parser.var_mapper,
+        n_never_sat=sat_parser.n_never_sat,
     )
     return prepared, prefixes, read_time, process_time
 
@@ -613,7 +627,10 @@ def create_worker_session(
     )
     trace(f"compiled elapsed={time() - compile_start:.3f}s")
 
+    # As run_solver: never-satisfiable soft clauses are not in the kernel's counts, so the threshold drops by them.
     unsat_h = int(runtime_common.unsat_thresh * 2 * n_vars) if runtime_common.unsat_thresh else 0
+    if prepared.n_never_sat:
+        unsat_h = max(unsat_h - prepared.n_never_sat, 0)
 
     trace("returning worker session")
     return AFSATWorkerSession(
@@ -636,6 +653,7 @@ def create_worker_session(
         x_spec=x_spec,
         fixed_spec=fixed_spec,
         unsat_h=unsat_h,
+        n_never_sat=prepared.n_never_sat,
         fuzz_limit=runtime_afsat.fuzz,
         counting=bool(runtime_common.counting),
         stats=output_cfg.stats,
@@ -691,7 +709,9 @@ def run_worker_single_batch(session: AFSATWorkerSession, prefix_vectors: Array |
     b_unsat, _, best_x_dev, best_row_dev, _ = summarise(opt_x, opt_unsat, opt_unsat_ct, session.penalty)
     best_unsat = int(jax.device_get(b_unsat))
 
-    threshold_hit = bool(session.unsat_h and best_unsat <= session.unsat_h)
+    threshold_hit = bool(session.unsat_h and best_unsat <= session.unsat_h) or bool(
+        session.n_never_sat and best_unsat == 0
+    )
     found_sol = threshold_hit or best_unsat == 0
 
     if session.fuzz_limit and (session.counting or not found_sol):
@@ -753,8 +773,9 @@ def run_worker_single_batch(session: AFSATWorkerSession, prefix_vectors: Array |
     best_str = session.prepared.var_mapper.assn_str(signed_best, session.binary_v, inc_zero=True)
 
     return AFSATBatchResult(
-        best_unsat=best_unsat,
-        sat=best_unsat == 0,
+        best_unsat=best_unsat + session.n_never_sat,
+        # With never-satisfiable soft clauses, satisfying every other clause is the MaxSAT optimum, not SAT.
+        sat=best_unsat == 0 and not session.n_never_sat,
         threshold_hit=threshold_hit,
         best_assignment_signed=signed_best,
         best_assignment_str=best_str,
@@ -776,6 +797,7 @@ def run_solver(
     prefix_vectors: Array | None = None,
     *,
     var_mapper: VarMapper,
+    n_never_sat: int = 0,
 ) -> float:
     runtime_common = config.runtime_common
     runtime_afsat = config.runtime_afsat
@@ -796,6 +818,12 @@ def run_solver(
     ffsat_seed = runtime_common.ffsat_seed
     weight_decay = runtime_common.weight_decay
     unsat_h = int(runtime_common.unsat_thresh * 2 * n_vars) if runtime_common.unsat_thresh else 0
+    # MaxSAT mode: soft clauses no assignment satisfies are not in the objectives, so the kernel's counts omit them.
+    # The threshold applies to the full cost, every reported cost adds them back, and with any present a kernel count
+    # of 0 is the optimum (cost n_never_sat) rather than a satisfying assignment.
+    if n_never_sat:
+        unsat_h = max(unsat_h - n_never_sat, 0)
+        logger.warning(f"MaxSAT mode: {n_never_sat} clauses can never be satisfied; the optimum cost is at least that")
     binary_v = output_cfg.binary_v
 
     devices = jax.devices("gpu")[:n_devices]
@@ -911,7 +939,7 @@ def run_solver(
             total=timeout,
             leave=True,
             position=len(infobars) + len(histbars),
-            desc=f"{desc} [MAX-SAT cost: {best_unsat}]",
+            desc=f"{desc} [MAX-SAT cost: {best_unsat + n_never_sat}]",
             bar_format="{l_bar}{bar}|{elapsed}/" + f"{str(timeout_m).zfill(2)}:{str(timeout_s).zfill(2)}" + "{postfix}",
             postfix=f"{0:.2f}s/it",
         )
@@ -968,7 +996,7 @@ def run_solver(
         tbatch = time()
         found_sol = False
 
-        if unsat_h and batch_best_unsat <= unsat_h:
+        if (unsat_h and batch_best_unsat <= unsat_h) or (n_never_sat and batch_best_unsat == 0):
             ttfs = time() - t0
             found_sol = True
             batches_done += 1
@@ -1094,7 +1122,7 @@ def run_solver(
                 # The penalty sums the unsatisfied counts over the restart_thresh batches since the last update (the
                 # earlier code concatenated the batches along the clause axis, so above 1 it used the first batch's).
                 if logger.isEnabledFor(logging.DEBUG):
-                    logger.debug(f"# Restart: {restart_ct} | Best MAX-SAT cost (#unsat): {best_unsat}")
+                    logger.debug(f"# Restart: {restart_ct} | Best MAX-SAT cost (#unsat): {best_unsat + n_never_sat}")
                     logger.debug(f"Unsat counts: {penalty}, \nBest: {np.flatnonzero(np.asarray(best_row_dev))}")
                 weights, penalty = reweight_weights(weights, penalty)
                 restart_ct += 1
@@ -1144,7 +1172,7 @@ def run_solver(
             pbelapse = pbar.format_dict["elapsed"]
             pbn = pbar.format_dict["n"]
             batch_elapsed = end_batch - start_batch
-            pbar.set_description(f"{desc} [MAX-SAT cost: {best_unsat}]")
+            pbar.set_description(f"{desc} [MAX-SAT cost: {best_unsat + n_never_sat}]")
             if pbn + batch_elapsed > timeout:
                 pbar.update(timeout - pbelapse)
             else:
@@ -1189,9 +1217,10 @@ def run_solver(
         assign_str = var_mapper.assn_str(signed_best, binary_v, inc_zero=True)
         # var_mapper.bin_str(signed_best) if binary_v else var_mapper.lits_str(signed_best, include_unknown=True)
 
-        print("s UNKNOWN")
+        # Every satisfiable clause satisfied, with some never satisfiable: the MaxSAT optimum.
+        print("s OPTIMUM FOUND" if n_never_sat and best_unsat == 0 else "s UNKNOWN")
         print("c Best found MAX-SAT assignment (zero energy variables omitted or -):")
-        print(f"o {best_unsat}")
+        print(f"o {best_unsat + n_never_sat}")
         print(f"v {assign_str} 0")
 
         assignment = {
@@ -1266,6 +1295,7 @@ def main(problem_file: str, config: AFSATConfig) -> None:
         xor_rref_meta=prepared.xor_rref_meta,
         prefix_vectors=prefixes,
         var_mapper=prepared.var_mapper,
+        n_never_sat=prepared.n_never_sat,
     )
 
     logger.info(f"Time reading input: {read_time}")

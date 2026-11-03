@@ -30,9 +30,17 @@ class PBSATFormula:
     Compactification is on by default to reduce the size of assignment vectors, and a variable ID map is constructed
     to recover original variable IDs when required.
 
+    Soft mode (`soft=True`, MaxSAT): every input clause is soft, since none of the input formats can mark a clause
+    hard. A clause that would pin literals under hard semantics (a unit clause, CARD/EK with k = n, EK with k = 0) is
+    kept as one soft clause instead, conflicting literals are not an error, and a clause no assignment satisfies
+    (length-1 NAE, CARD/EK with k > n) is counted in `n_never_sat` rather than raising UnsatError. A length-1 XOR is a
+    unit clause in both modes.
+
     Attributes:
         clause_sets (dict[ClauseSignature, Clauses]): Clause groups keyed by signature (type, length, cardinality (opt))
-        unit_prefix (set[int]): Unit literals derived while parsing constraints.
+        unit_prefix (set[int]): Unit literals derived while parsing constraints (always empty in soft mode).
+        soft (bool): Soft (MaxSAT) clause semantics, as above.
+        n_never_sat (int): Soft clauses no assignment satisfies; they are not in clause_sets.
         n_var (int): Active variable count after loading.
         n_clause (int): Loaded clause count.
         workers (int): Worker threads for clause processing.
@@ -54,11 +62,14 @@ class PBSATFormula:
         disk_cache: str = "",
         file: str = "",
         compactify: bool = True,
+        soft: bool = False,
     ) -> None:
         self.clause_sets: dict[ClauseSignature, Clauses] = {}
         self.n_devices: int = n_devices
         self.workers: int = workers
         self.compactify: bool = compactify
+        self.soft: bool = soft
+        self.n_never_sat: int = 0
         self.unit_prefix: set[int] = set()
         self.var_mapper: VarMapper = VarMapper()
         self.disk_cache: AFSAT_DFTCache | None = None
@@ -125,11 +136,23 @@ class PBSATFormula:
 
         self.clause_sets = {}
         self.unit_prefix = set()
+        self.n_never_sat = 0
         self.seen_max_var = 0
         self.seen_clauses = 0
 
         throttle = LogThrottle(logger)
         used_input_vars: set[int] = set()
+
+        def __keep_all_true(lits: list[int]) -> None:
+            """Soft mode: one clause requiring every literal true (CNF if a single literal, else CARD k = n)."""
+            n = len(lits)
+            sig = ClauseSignature("cnf", 1, 0) if n == 1 else ClauseSignature("card", n, n)
+            self.clause_sets.setdefault(sig, []).append(lits)
+
+        def __never_sat(idx: int, line: str) -> None:
+            """Soft mode: a clause no assignment satisfies counts as violated, without entering the objective."""
+            throttle.debug("never", f"Line {idx}: Clause can never be satisfied; counted as violated: {line}")
+            self.n_never_sat += 1
 
         def __process_clause(idx: int, line: str, tokens: list[str]) -> None:
             """
@@ -212,15 +235,25 @@ class PBSATFormula:
 
             if n == 1:
                 match clause_type:
-                    case "nae" | "xor":
-                        logger.error(f"Line {idx}: Length 1 NAE/XOR clause has no SAT semantics (UNSAT): {line}")
+                    case "nae":
+                        # Not-all-equal over one literal never holds: a single literal is always equal to itself.
+                        if self.soft:
+                            __never_sat(idx, line)
+                            return
+                        logger.error(f"Line {idx}: Length 1 NAE clause can never be satisfied (UNSAT): {line}")
                         raise UnsatError
 
                     case "amo":
                         throttle.debug("u_amo", f"Line {idx}: Skipping length 1 AMO clause (trivially SAT): {line}")
                         return
 
-                    case "eo" | "cnf":
+                    # n-ary XOR is the fold of the binary operator (identity False), so XOR of one literal is that
+                    # literal: a unit clause, as in CryptoMiniSat (`x1 0` forces x1, `x-1 0` forces -x1).
+                    case "eo" | "cnf" | "xor":
+                        if self.soft:
+                            throttle.debug("u_soft", f"Line {idx}: Keeping unit clause as a soft clause: {line}")
+                            __keep_all_true(lits)
+                            return
                         throttle.debug("u_eo", f"Line {idx}: Prefixing unit literals enoded as EO: {line}")
                         if -lits[0] in self.unit_prefix:
                             logger.error(f"Conflict found among unit literals - {dimacs_file} is UNSAT")
@@ -243,10 +276,17 @@ class PBSATFormula:
                         card = -card
 
                 if card > n:
+                    if self.soft:
+                        __never_sat(idx, line)
+                        return
                     logger.error(f"Line {idx}: CARD/EK claues with card > #lits (always UNSAT): {line}")
                     raise UnsatError
 
                 if card == n:
+                    if self.soft:
+                        throttle.debug("k=n_soft", f"Line {idx}: Keeping CARD/EK-{n} as one soft clause: {line}")
+                        __keep_all_true(lits)
+                        return
                     throttle.debug("k=n", f"Line {idx}: Prefixing {n} unit literals enoded as CARD/EK-{n}: {line}")
                     for lit in lits:
                         if -lit in self.unit_prefix:
@@ -259,6 +299,10 @@ class PBSATFormula:
                 if card == 0:
                     if clause_type == "card":
                         throttle.debug("c0", f"Line {idx}: Skipping CARD-0 clause (trivially SAT): {line}")
+                        return
+                    elif self.soft:
+                        throttle.debug("ek0_soft", f"Line {idx}: Keeping EK-0 as one soft clause (all false): {line}")
+                        __keep_all_true([-lit for lit in lits])
                         return
                     else:
                         throttle.debug("ek0", f"Line {idx}: Prefixing negated EK-0 clause (trivially SAT): {line}")
@@ -337,6 +381,8 @@ class PBSATFormula:
                             raise e
 
                 throttle.flush()
+                if self.n_never_sat:
+                    logger.warning(f"{self.n_never_sat} soft clauses can never be satisfied; counted as violated")
 
                 if self.seen_clauses != self.n_clause or self.seen_max_var != self.n_var:
                     logger.warning(
