@@ -95,17 +95,22 @@ class AdvicePool:
     def elite_size(self) -> int:
         return int(min(len(self), max(2, np.ceil(self.elite_frac * self.seen))))
 
-    def advice(self, k: int, min_agree: float = 0.0) -> tuple[np.ndarray, np.ndarray, dict]:
+    def advice(self, k: int, min_agree: float = 0.0, also_fixed: np.ndarray | None = None
+               ) -> tuple[np.ndarray, np.ndarray, dict]:
         """Phases and the order of the first k free variables: agreement among the elite, then its mean |x|.
         The phase is the elite's majority sign (the best descent's sign breaks a tie). Variables with agreement
         below min_agree are not advised (measured on SHA-1 cubes, agreement below about 0.8 is right only by
-        chance), so the list can be shorter than k."""
+        chance), so the list can be shorter than k. also_fixed (a prefix vector, such as the discrete solver's
+        newest trail) keeps the variables it assigns out of the k slots without changing what the descents are
+        conditioned on: the discrete solver has already set them."""
         m = self.elite_size()
         s, mg = self.signs[:m], self.margins[:m].astype(np.float32)
         mean = s.mean(axis=0)
         agree = np.abs(mean)
         phase = np.where(mean != 0, np.sign(mean), s[0]).astype(np.int8)
         free = np.flatnonzero(self.prefix == 0) if self.prefix is not None else np.arange(s.shape[1])
+        if also_fixed is not None:
+            free = free[np.asarray(also_fixed)[free] == 0]
         if min_agree > 0:
             free = free[agree[free] >= min_agree]
         order = free[np.lexsort((-mg.mean(axis=0)[free], -agree[free]))][:k]
