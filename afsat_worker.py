@@ -19,6 +19,7 @@ from afsat import (
     prepare_problem,
     run_worker_single_batch,
 )
+from advice_pool import AdvicePool, LineReader
 from sat_loader import UnsatError
 from samplers import SAMPLERS
 from utils import AFSATConfig, LOG_LEVELS
@@ -145,15 +146,149 @@ def parse_prefix_line(line: str) -> tuple[np.ndarray, bool]:
     return lits, False
 
 
-def assignment_vector_to_lits(assign_vec: np.ndarray) -> np.ndarray:
-    """Map AFSAT assignment vector in {-1,0,+1} back to signed literals."""
-    nz = np.nonzero(assign_vec)[0]
+def assignment_vector_to_lits(assign_vec: np.ndarray, var_mapper=None, order: np.ndarray | None = None) -> np.ndarray:
+    """Map an AFSAT assignment vector in {-1,0,+1} (-1 is TRUE) back to signed literals in the input file's
+    variable numbering, in index order or in the given order of variable indices."""
+    nz = np.nonzero(assign_vec)[0] if order is None else order[assign_vec[order] != 0]
     if nz.size == 0:
         return np.empty(0, dtype=np.intc)
 
     signs = np.sign(assign_vec[nz]).astype(np.intc)
     lits = (nz.astype(np.intc) + 1) * (-signs)
+    if var_mapper is not None and var_mapper.dense_to_input_var:  # the loader compacted sparse variable ids
+        lits = np.asarray([var_mapper.dense_to_input(int(l)) for l in lits], dtype=np.intc)
     return lits.astype(np.intc)
+
+
+ADVICE_POLICIES = ("index", "agree", "random")  # random: free variables and phases at random (a control)
+
+
+def agreement_advice(
+    points: np.ndarray, points_unsat: np.ndarray, free: np.ndarray, elite_frac: float, best_signed: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, dict]:
+    """Advice ordered by agreement among the batch's best descents.
+
+    The elite is the best ceil(elite_frac * batch) descents by violated-clause count (at least 2). For each free
+    variable the elite's mean sign gives the phase (the best descent's sign breaks a tie) and its magnitude the
+    agreement. Variables are ordered by agreement, then by the elite's mean |x| (how firmly the descents hold the
+    value). Returns the signed phase vector, the variable order and summary statistics for the log."""
+    batch = points.shape[0]
+    m = min(batch, max(2, int(np.ceil(elite_frac * batch))))
+    elite = np.argsort(points_unsat, kind="stable")[:m]
+    signs = np.sign(points[elite])
+    mean = signs.mean(axis=0)
+    agree = np.abs(mean)
+    margin = np.abs(points[elite]).mean(axis=0)
+    phase = np.where(mean != 0, np.sign(mean), best_signed).astype(np.int8)
+    idx = np.flatnonzero(free)
+    order = idx[np.lexsort((-margin[idx], -agree[idx]))]
+    unanimous = int(np.count_nonzero(agree[idx] == 1.0))
+    stats = {"elite": m, "elite_unsat_min": int(points_unsat[elite[0]]), "elite_unsat_max": int(points_unsat[elite[-1]]),
+             "free": int(idx.size), "unanimous": unanimous,
+             "agree_q50": float(np.median(agree[idx])) if idx.size else 0.0}
+    return phase, order, stats
+
+
+class NodeSessions:
+    """Compiled worker sessions keyed by problem file, so one live worker serves every Dagster DAG node its helper
+    meets. A node's clause set is fixed for the run and a job changes only assignments, so the worker builds a
+    node's session the first time the bridge names it (the persistent compilation cache makes a rebuild cheap) and
+    reuses it afterwards."""
+
+    def __init__(self, config: AFSATConfig, first_path: str):
+        self.config = config
+        self.cache: dict[str, tuple] = {}
+        self.path = None
+        self.read_time = self.process_time = 0.0
+        self.switch(first_path)
+
+    def switch(self, path: str) -> None:
+        if path == self.path:
+            return
+        if path not in self.cache:
+            t = time()
+            prepared, _, self.read_time, self.process_time = prepare_problem(path, self.config, prefix_file="")
+            session = create_worker_session(
+                prepared,
+                self.config,
+                prefix_count=1,
+                trace_hook=lambda message: emit_log(f"create_worker_session {message}"),
+            )
+            self.cache[path] = (prepared, session)
+            emit_log(f"node session built path={path} vars={prepared.n_var} batch={session.batch} "
+                     f"in {time() - t:.2f}s (sessions cached: {len(self.cache)})")
+        else:
+            emit_log(f"node session reused path={path}")
+        self.path = path
+        self.prepared, self.session = self.cache[path]
+        self.var_mapper = self.prepared.sat_parser.var_mapper
+
+
+class Inbox:
+    """One drain of the bridge's input, reduced to what still matters.
+
+    The bridge numbers its jobs. A job starts with `NODE <seq> <id> <cnf path>` when the DAG node changes (and not
+    otherwise), then `MESSAGE <seq> <n> <lits>`, the job's incoming assignments, which the worker acknowledges with
+    `READY <seq>`; the bridge discards any output before that acknowledgement and forwards PREFIX lines only after
+    it. When several jobs are waiting, only the newest is acted on: `node` is the session it needs (None to keep the
+    current one), `message` its (seq, literals), and `prefix` the newest PREFIX sent after it. `pending_node` holds a
+    NODE whose MESSAGE has not been read yet; until it arrives the previous job's state is stale."""
+
+    def __init__(self, pending_node: str | None = None):
+        self.stop = False
+        self.node: str | None = None
+        self.message: tuple[int, np.ndarray] | None = None
+        self.prefix: np.ndarray | None = None
+        self.pending_node = pending_node
+
+
+def parse_job_line(raw: str) -> tuple[str, object] | None:
+    """('node', path) for a NODE line, ('message', (seq, lits)) for a MESSAGE line, None for anything else."""
+    head = raw.split(maxsplit=1)[0].upper() if raw.strip() else ""
+    if head == "NODE":
+        parts = raw.split(maxsplit=3)  # the path may contain spaces
+        if len(parts) < 4:
+            raise ValueError("NODE needs a sequence number, a node id and a CNF path")
+        return "node", parts[3].strip()
+    if head == "MESSAGE":
+        parts = raw.split()
+        if len(parts) < 3:
+            raise ValueError("MESSAGE needs a sequence number and a literal count")
+        seq, n = int(parts[1]), int(parts[2])
+        if len(parts) - 3 < n:
+            raise ValueError(f"MESSAGE expected {n} literals, got {len(parts) - 3}")
+        return "message", (seq, np.asarray([int(x) for x in parts[3:3 + n]], dtype=np.intc))
+    return None
+
+
+def drain(reader: LineReader, block: bool, pending_node: str | None) -> Inbox:
+    """Read every line waiting (with block, wait for at least one) and reduce them to an Inbox."""
+    inbox = Inbox(pending_node)
+    lines = [raw for raw in reader.read_lines(block=block) if raw.strip()]
+    parsed = []
+    for raw in lines:
+        try:
+            job = parse_job_line(raw)
+            if job is None:
+                lits, stop = parse_prefix_line(raw)
+                job = ("stop", None) if stop else ("prefix", lits)
+        except ValueError as err:
+            emit_log(f"request_failed {err}")
+            continue
+        if job[0] == "stop":
+            inbox.stop = True
+            return inbox
+        parsed.append(job)
+    last_message = max((i for i, (kind, _) in enumerate(parsed) if kind == "message"), default=-1)
+    for i, (kind, value) in enumerate(parsed):
+        if kind == "node":
+            inbox.pending_node, inbox.prefix = value, None  # prefixes before it belong to an earlier job
+        elif kind == "message" and i == last_message:
+            inbox.node, inbox.pending_node = inbox.pending_node, None
+            inbox.message, inbox.prefix = value, None
+        elif kind == "prefix" and value.size:
+            inbox.prefix = value
+    return inbox
 
 
 def run_worker(
@@ -169,18 +304,22 @@ def run_worker(
     emit_log(f"GPUS: {jax.devices('gpu')}")
     start_time = time()
     emit_log(f"start_time set {start_time}, preparing problem")
-    prepared, _, read_time, process_time = prepare_problem(problem_file, config, prefix_file="")
-    prep_time = time()
-    emit_log(f"prep_time set {prep_time}, creating session")
-    session = create_worker_session(
-        prepared,
-        config,
-        prefix_count=1,
-        trace_hook=lambda message: emit_log(f"create_worker_session {message}"),
-    )
-    worker_time = time()
+    nodes = NodeSessions(config, problem_file)
+    worker_time = prep_time = time()
+    prepared, session = nodes.prepared, nodes.session
+    read_time, process_time = nodes.read_time, nodes.process_time
 
     n_units = len(prepared.sat_parser.unit_prefix)
+
+    # Advice policy (Dagster's launch command passes no worker flags, so these are environment variables):
+    #   AFSAT_ADVICE=index (default) | agree | random, AFSAT_ADVICE_ELITE=<fraction of the batch, default 0.5>,
+    #   AFSAT_ADVICE_STATS=1 logs the agreement statistics under either policy.
+    advice_policy = os.environ.get("AFSAT_ADVICE", "index")
+    if advice_policy not in ADVICE_POLICIES:
+        raise ValueError(f"AFSAT_ADVICE={advice_policy}: expected one of {ADVICE_POLICIES}")
+    elite_frac = float(os.environ.get("AFSAT_ADVICE_ELITE", "0.5"))
+    collect_points = advice_policy == "agree" or os.environ.get("AFSAT_ADVICE_STATS") == "1"
+    rng = np.random.default_rng(config.runtime_common.rand_seed if config.runtime_common.rand_seed >= 0 else None)
 
     emit_log(
         f"Worker ready | world_rank={world_rank} helper_rank={helper_rank}/{helper_count} "
@@ -197,50 +336,69 @@ def run_worker(
         f"worker_ready world_rank={world_rank} helper_rank={helper_rank}/{helper_count} "
         f"vars={prepared.n_var} clauses={prepared.n_clause} batch={session.batch} phase={phase}"
     )
-    emit_line("READY")
+    emit_line("READY")  # start-up; each job is acknowledged with READY <seq> (see Inbox)
 
+    reader = LineReader(sys.stdin.fileno())
+    if os.environ.get("AFSAT_WORKER_MODE", "oneshot") == "stream":
+        run_stream(nodes, reader, int(suggestion_size), elite_frac, int(os.environ.get("AFSAT_ADVICE_POOL", "1024")))
+        return
+
+    # One batch for the newest PREFIX waiting (older ones are superseded by the time a batch finishes).
+    pending_node = None
     while True:
-        # emit_log("reading next line...")
-        raw = sys.stdin.readline()
-        # emit_log(f"read {raw[:100]} [...]")
-        if raw == "":
+        inbox = drain(reader, block=True, pending_node=pending_node)
+        if inbox.stop:
+            emit_log("Stop command received; shutting down worker loop")
+            return
+        if reader.eof and inbox.message is None and inbox.prefix is None:
             emit_log("Bridge stdin closed; exiting")
             return
+        pending_node = inbox.pending_node
+        if inbox.message is not None:
+            if inbox.node is not None:
+                nodes.switch(inbox.node)
+            emit_line(f"READY {inbox.message[0]}")
+        if pending_node is not None or inbox.prefix is None:
+            continue
+        prepared, session, var_mapper = nodes.prepared, nodes.session, nodes.var_mapper
+        prefix_lits = inbox.prefix
 
         try:
-            # emit_log("Attempt prefix parse")
-            prefix_lits, stop = parse_prefix_line(raw)
-            # emit_log("Received Prefix from Dagster")
-            if stop:
-                emit_log("Stop command received; shutting down worker loop")
-                return
-
-            if prefix_lits.size == 0:
-                continue
-
-            # emit_log("Prefix valid, running optimser")
             # Go through the loader rather than mapping the literals here. It merges the
             # problem-implied unit literals into the prefix (the loader strips unit clauses
             # from the clause arrays, so nothing else enforces them) and raises UnsatError
             # when the cube contradicts one of them or itself.
             prefix_vector = prepared.sat_parser.process_prefix_line([str(int(v)) for v in prefix_lits.tolist()])
             prefix_vectors = jnp.asarray(prefix_vector)[None, :]
-            result = run_worker_single_batch(session, prefix_vectors)
+            result = run_worker_single_batch(session, prefix_vectors, collect_points=collect_points)
 
             assign_vec_full = np.asarray(result.best_assignment_signed, dtype=np.int8)
             # Suggestions should not simply repeat fixed literals. That means every fixed
             # position, not just the received cube: the merged unit literals would otherwise
             # consume the whole suggestion budget with values the caller already knows.
-            assign_vec_suggest = assign_vec_full.copy()
-            assign_vec_suggest[np.asarray(prefix_vector) != 0] = 0
-
-            lits = assignment_vector_to_lits(assign_vec_suggest)
+            free = np.asarray(prefix_vector) == 0
             max_suggestions = max(int(suggestion_size), 0)
+            if collect_points:
+                phase, order, stats = agreement_advice(
+                    result.points, result.points_unsat, free, elite_frac, assign_vec_full
+                )
+                emit_log("advice policy=%s batch_best=%d %s" % (
+                    advice_policy, result.best_unsat, " ".join("%s=%s" % kv for kv in stats.items())))
+            if advice_policy == "agree":
+                lits = assignment_vector_to_lits(phase, var_mapper, order=order[:max_suggestions])
+            elif advice_policy == "random":
+                pick = rng.permutation(np.flatnonzero(free))[:max_suggestions]
+                lits = assignment_vector_to_lits(rng.choice(np.array([-1, 1], dtype=np.int8), size=free.size),
+                                                 var_mapper, order=pick)
+            else:
+                assign_vec_suggest = assign_vec_full.copy()
+                assign_vec_suggest[~free] = 0
+                lits = assignment_vector_to_lits(assign_vec_suggest, var_mapper)
             suggestion_lits = lits[:max_suggestions]
             emit_bridge_line("SUGGEST", suggestion_lits)
 
             if result.sat:
-                solution_lits = assignment_vector_to_lits(assign_vec_full)
+                solution_lits = assignment_vector_to_lits(assign_vec_full, var_mapper)
                 emit_bridge_line("SOLUTION", solution_lits)
 
         except UnsatError as err:
@@ -254,6 +412,101 @@ def run_worker(
             # as we do for an UnsatError.
             logger.exception("Worker request failed; skipping prefix")
             emit_log(f"request_failed {err}")
+
+
+ADVICE_CONDITIONS = ("trail", "message")
+
+
+def run_stream(nodes: NodeSessions, reader: LineReader, suggestion_size: int, elite_frac: float, capacity: int) -> None:
+    """Streaming worker (AFSAT_WORKER_MODE=stream): descend continuously, pool the descents
+    (advice_pool.AdvicePool), and emit refreshed agreement advice after every batch. Input is read without blocking
+    and only the newest job and prefix waiting are used (see Inbox). Each job starts a fresh pool.
+
+    AFSAT_ADVICE_CONDITION selects what the descents are conditioned on:
+      trail (default)  the newest PREFIX, the CDCL's whole trail; the pool keeps the descents consistent with each
+                       new prefix.
+      message          the job's incoming assignments (the MESSAGE line), which hold for the whole job, so the pool
+                       keeps accumulating while the trail churns. The newest trail still decides which variables
+                       fill the suggestion_size slots: those it assigns are left out, since the CDCL has set them.
+    AFSAT_ADVICE_MIN_AGREE withholds literals whose elite agreement is below the threshold. With
+    AFSAT_BRIDGE_LOG_PREFIX=1 each prefix used is written to the bridge trace file as `PREFIX_USED <n> <lits>`."""
+    condition = os.environ.get("AFSAT_ADVICE_CONDITION", "trail").strip().lower()
+    if condition not in ADVICE_CONDITIONS:
+        raise ValueError(f"AFSAT_ADVICE_CONDITION={condition!r}: expected one of {ADVICE_CONDITIONS}")
+    by_message = condition == "message"
+    log_prefix = os.environ.get("AFSAT_BRIDGE_LOG_PREFIX") == "1"
+    min_agree = float(os.environ.get("AFSAT_ADVICE_MIN_AGREE", "0"))
+    prepared, session, var_mapper = nodes.prepared, nodes.session, nodes.var_mapper
+    pool = AdvicePool(prepared.n_var, capacity=capacity, elite_frac=elite_frac)
+    prefix_vector = prefix_vectors = trail_vector = None
+    pending_node = None
+    batches = prefixes = dropped_total = jobs = 0
+
+    def to_vector(lits: np.ndarray) -> np.ndarray | None:
+        try:
+            return np.asarray(prepared.sat_parser.process_prefix_line([str(int(v)) for v in lits.tolist()]))
+        except UnsatError as err:
+            emit_log(f"unsat_prefix {err}")
+            return None
+
+    while True:
+        inbox = drain(reader, block=prefix_vector is None or pending_node is not None, pending_node=pending_node)
+        if inbox.stop:
+            emit_log(f"Stop command received; shutting down worker loop (jobs={jobs} batches={batches} "
+                     f"prefixes={prefixes})")
+            return
+        if reader.eof and inbox.message is None and inbox.prefix is None:
+            emit_log("Bridge stdin closed; exiting")
+            return
+        pending_node = inbox.pending_node
+        if inbox.message is not None:  # a new job: nothing from the previous one carries over
+            if inbox.node is not None:
+                nodes.switch(inbox.node)
+            prepared, session, var_mapper = nodes.prepared, nodes.session, nodes.var_mapper
+            pool = AdvicePool(prepared.n_var, capacity=capacity, elite_frac=elite_frac)
+            prefix_vector = prefix_vectors = trail_vector = None
+            jobs += 1
+            seq, message = inbox.message
+            if by_message:  # may be empty (a source node): the problem's own units then condition alone
+                prefix_vector = to_vector(message)
+                if prefix_vector is not None:
+                    prefix_vectors = jnp.asarray(prefix_vector)[None, :]
+                    pool.set_prefix(prefix_vector)
+            emit_line(f"READY {seq}")
+        if pending_node is not None:  # the next job's MESSAGE has not arrived yet
+            prefix_vector = None
+            continue
+        if inbox.prefix is not None:
+            pv = to_vector(inbox.prefix)
+            prefixes += 1
+            if log_prefix and BRIDGE_TRACE_FH is not None:
+                BRIDGE_TRACE_FH.write("PREFIX_USED %d %s\n" % (
+                    inbox.prefix.size, " ".join(map(str, inbox.prefix.tolist()))))
+            if by_message:
+                trail_vector = pv  # None (a trail contradicting the units) leaves the advice unfiltered
+            elif pv is not None:
+                prefix_vector, prefix_vectors = pv, jnp.asarray(pv)[None, :]
+                dropped_total += pool.set_prefix(prefix_vector)
+            else:
+                prefix_vector = None
+        if prefix_vector is None:
+            continue
+        try:
+            result = run_worker_single_batch(session, prefix_vectors, collect_points=True)
+        except UnsatError as err:
+            emit_log(f"unsat_prefix {err}")
+            prefix_vector = None
+            continue
+        batches += 1
+        pool.add(result.points, result.points_unsat)
+        phase, order, stats = pool.advice(suggestion_size, min_agree, also_fixed=trail_vector)
+        emit_bridge_line("SUGGEST", assignment_vector_to_lits(phase, var_mapper, order=order))
+        if result.sat:
+            emit_bridge_line("SOLUTION", assignment_vector_to_lits(
+                np.asarray(result.best_assignment_signed, dtype=np.int8), var_mapper))
+        if batches % 50 == 0:
+            emit_log("stream condition=%s jobs=%d batches=%d prefixes=%d dropped=%d %s" % (
+                condition, jobs, batches, prefixes, dropped_total, " ".join("%s=%s" % kv for kv in stats.items())))
 
 
 def main() -> None:
@@ -332,6 +585,14 @@ def main() -> None:
     instantiated = ap.instantiate(parsed)
     config = instantiated.config
     config.runtime_common.n_devices = config.runtime_common.n_devices or n_devices
+    # Dagster's launch command passes no worker flags, so these two can also be set from the environment.
+    if os.environ.get("AFSAT_WORKER_BATCH"):  # batch per device (as -b)
+        config.runtime_afsat.batch_per_device = int(os.environ["AFSAT_WORKER_BATCH"])
+    if os.environ.get("AFSAT_PGD_RULE"):  # PGD update rule (as --pgd_rule)
+        rule = os.environ["AFSAT_PGD_RULE"].strip().lower()
+        if rule not in ("spg", "fista"):
+            raise ValueError(f"AFSAT_PGD_RULE={rule!r}: expected spg or fista")
+        config.optimiser.pgd_rule = rule
 
     problem_file = parsed.cnf if parsed.cnf else parsed.problem_file
     if not problem_file:

@@ -205,6 +205,39 @@ AFSAT supports multiple optimization backends (default: `pgd`):
 
 Select the backend with `-o`.
 
+### Dagster helper (`afsat_worker.py`)
+
+`afsat_worker.py` runs AFSAT as a helper to a Dagster CDCL worker (`--helper_backend cls`). One worker process lives for the whole Dagster run and serves every job its helper is given, on any DAG node. It compiles the first node's problem, reports `READY`, then reads lines on stdin and answers on stdout:
+
+- `NODE <seq> <id> <cnf path>`: job `seq` is on another DAG node. The worker compiles that node's problem the first time it is named and reuses the compiled session afterwards.
+- `MESSAGE <seq> <n> <lits>`: job `seq`'s incoming assignments (possibly none). The worker starts afresh and answers `READY <seq>`. The bridge discards any output sent before that answer and forwards prefixes only after it.
+- `PREFIX <n> <lits>`: the CDCL's current assignments. The worker answers `SUGGEST <k> <lits>` and, if a descent satisfies every clause, `SOLUTION <k> <lits>`. Depending on Dagster's `--advice_mode`, the CDCL takes the suggested literals as decisions (skipping any already assigned) or as saved phases.
+- `STOP`: exit.
+
+When several lines are waiting, the worker acts only on the newest job and the newest prefix after it.
+
+Dagster's launch command passes no worker flags, so these options are environment variables:
+
+- `AFSAT_WORKER_MODE`:
+  - `oneshot` (default): one batch per PREFIX.
+  - `stream`: descend continuously, pooling the descents of successive batches, and send refreshed advice after every batch.
+- `AFSAT_ADVICE_CONDITION` (stream mode): what the descents are conditioned on.
+  - `trail` (default): the newest PREFIX.
+  - `message`: the job's MESSAGE. It holds for the whole job, so the pool keeps growing while the CDCL's trail changes. The newest PREFIX then only chooses which variables fill the `k` suggestion slots: variables it assigns are left out. This suits Dagster's `--advice_mode phase`.
+- `AFSAT_ADVICE` (one-shot mode): the advice policy.
+  - `index` (default): the best descent's values for the first k free variables.
+  - `agree`: variables ordered by agreement among the best descents.
+  - `random`: random free variables and values, as a control.
+- `AFSAT_ADVICE_ELITE`: the fraction of descents, best first, whose agreement orders the advice (default 0.5; on SHA-1 cubes, half the descents gave more reliable agreement than the best quarter or tenth for pools of up to 512).
+- `AFSAT_ADVICE_MIN_AGREE` (stream mode): withhold literals whose agreement is below this threshold (default 0).
+- `AFSAT_ADVICE_POOL` (stream mode): the most descents kept (default 1024). When the prefix changes, the pool keeps the descents that agree with it.
+- `AFSAT_WORKER_BATCH`: batch per device, as `-b`.
+- `AFSAT_PGD_RULE`: the PGD update rule, as `--pgd_rule`.
+- `AFSAT_ADVICE_STATS=1`: log agreement statistics in one-shot mode.
+- `AFSAT_BRIDGE_LOG_PREFIX=1` (stream mode): record each PREFIX used in the trace file.
+
+Advice built from agreement needs enough descents to carry signal. On SHA-1 cubes, the 30 most-agreed literals were right about 90% of the time from about 128 pooled descents, against chance (about 50%) for the best single descent and for agreement within batches of 16.
+
 ## License
 
 Dual-licensed under:
