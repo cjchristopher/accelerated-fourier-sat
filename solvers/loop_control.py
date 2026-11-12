@@ -43,6 +43,16 @@ advances and the loop never exits (PLE at tol 1e-12 hung this way, on JAX 0.11.2
 evaluates the test once per trial in the body and carries it, so the condition only reads a stored flag. Trial
 points and accepted steps are unchanged, and a rolled search now evaluates the objective once per trial instead of
 twice.
+
+PGD has two update rules (`method`, from the optimiser config's `pgd_rule`):
+
+  spg    spectral projected gradient (_LoopAwareSPG below), the default. Every iterate is feasible, it has
+         stationarity guarantees for smooth non-convex objectives on convex sets, and on SHA-1 r20 preimages
+         (16 instances, 5 random-seed repetitions of 300 s) it reached a lower best unsatisfied count than FISTA on
+         every instance; on PLE and cardinality benchmarks it matched FISTA within noise.
+  fista  FISTA with jaxopt's backtracking, the previous default, kept to reproduce earlier runs and for problems
+         where its extrapolated points outside the box help (on PLE they solve more descents than FISTA with the
+         extrapolated point clipped to the box).
 """
 
 from __future__ import annotations
@@ -50,7 +60,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from functools import partial
-from typing import Optional
+from typing import Any, NamedTuple, Optional
 
 import jax
 import jax.numpy as jnp
@@ -58,9 +68,12 @@ from jaxopt import LBFGSB, ProjectedGradient, ProximalGradient
 from jaxopt._src import base, loop, prox
 from jaxopt._src.linesearch_util import _setup_linesearch
 from jaxopt._src.proximal_gradient import ProxGradState
-from jaxopt._src.tree_util import tree_add_scalar_mul, tree_l2_norm, tree_single_dtype, tree_sub, tree_vdot
+from jaxopt._src.tree_util import (
+    tree_add_scalar_mul, tree_l2_norm, tree_single_dtype, tree_sub, tree_vdot, tree_zeros_like,
+)
 
 PGD_LS_UNROLL_MIN_BATCH = 1024
+PGD_RULES = ("spg", "fista")
 
 # AFSAT_STOP selects the PGD stopping measure: "gradmap" (default) is the gradient mapping described above,
 # "legacy" is jaxopt's ||x_{k+1} - x_k|| / s_next, kept to reproduce earlier runs.
@@ -134,8 +147,8 @@ class _LoopAwareProximalGradient(ProximalGradient):
         fun_with_aux, _, _ = base._make_funs_with_aux(
             fun=self.fun, value_and_grad=self.value_and_grad, has_aux=self.has_aux
         )
-        fun_without_aux = lambda *a, **kw: fun_with_aux(*a, **kw)[0]
-        ls = partial(carried_fista_line_search, fun_without_aux, self._prox_grad, self.jit, self.ls_unroll)
+        self._fun_without_aux = lambda *a, **kw: fun_with_aux(*a, **kw)[0]
+        ls = partial(carried_fista_line_search, self._fun_without_aux, self._prox_grad, self.jit, self.ls_unroll)
         self._fista_line_search = jax.jit(ls, static_argnums=(0,)) if self.jit else ls
 
     def _update_accel(self, x, state, hyperparams_prox, args, kwargs):
@@ -164,17 +177,122 @@ class _LoopAwareProximalGradient(ProximalGradient):
         return base.OptStep(params=next_x, state=next_state)
 
 
+class SPGState(NamedTuple):
+    """Spectral projected gradient state; `iter_num` and `error` drive jaxopt's run loop as for ProxGradState."""
+    iter_num: Any
+    stepsize: Any  # the spectral step used by the last iteration
+    error: Any
+    aux: Any
+    x_prev: Any  # the iterate and gradient the last iteration started from (for the Barzilai-Borwein step)
+    g_prev: Any
+    f_hist: Any  # objective at the last `memory` iterates, newest first (-inf where unfilled)
+
+
+def spg_line_search(fun, jit, unroll, maxls, x, d, f_ref, slope_gd, f_tol, decrease_factor, args, kwargs):
+    """Backtracking along the segment x + lam * d (lam = 1, decrease_factor, ...) until
+    f(x + lam d) <= f_ref + lam * slope_gd + f_tol, with the test carried in the loop state as in
+    carried_fista_line_search. Returns (lam, still_insufficient); the second is True only when all maxls
+    reductions were rejected, in which case the last trial is returned unchecked."""
+
+    def insufficient(lam):
+        return fun(tree_add_scalar_mul(x, lam, d), *args, **kwargs) > f_ref + lam * slope_gd + f_tol
+
+    def body(state):
+        lam = state[0] * decrease_factor
+        return lam, insufficient(lam)
+
+    one = jnp.ones_like(f_ref)
+    lam, bad = loop.while_loop(cond_fun=lambda state: state[1], body_fun=body, init_val=(one, insufficient(one)),
+                               maxiter=maxls, unroll=unroll, jit=jit)
+    return lam, bad
+
+
+@dataclass(eq=False)
+class _LoopAwareSPG(_LoopAwareProximalGradient):
+    """Spectral projected gradient ("spg"), algorithm SPG2 of Birgin, Martinez and Raydan, "Nonmonotone spectral
+    projected gradient methods on convex sets", SIAM J. Optim. 10 (2000).
+
+    Each iteration takes the projected direction d = P(x - a g) - x for the Barzilai-Borwein step
+    a = (s.s)/(s.y), s and y being the last change in iterate and gradient, clipped to [step_min, step_max]
+    (step_max when s.y <= 0, i.e. no positive curvature along the last step; the first iteration uses
+    1 / ||P(x - g) - x||_inf). It then backtracks along the segment x + lam d, which stays feasible, until the
+    non-monotone Armijo test f(x + lam d) <= max(last `memory` values of f) + slope lam g.d holds. The
+    objective may rise between iterations but never above the recent maximum; this converges to stationary
+    points for smooth non-convex objectives on closed convex sets, which is what the boxes and the XOR projection
+    give. A rounding allowance of f_tol_ulps ulp of f is added to the test (the trial's f is evaluated by a
+    different kernel from the one that computed f(x)). There is no momentum, so every trial lies in the feasible
+    set.
+
+    Stopping, as for FISTA here: the gradient mapping at unit step, ||P(x - g) - x||, which is zero exactly at
+    stationary points and, unlike a mapping at the spectral step, cannot be made small by a long step; an
+    exhausted search reports an infinite error (the last trial, at lam = decrease_factor**maxls, is kept).
+    Each iteration costs one value-and-gradient and one objective evaluation per trial, as FISTA's does.
+    """
+
+    memory: int = 10
+    slope: float = 1e-4
+    step_min: float = 1e-10
+    step_max: float = 1e10
+    f_tol_ulps: float = 8.0
+
+    def __post_init__(self):
+        super().__post_init__()
+        ls = partial(spg_line_search, self._fun_without_aux, self.jit, self.ls_unroll)
+        self._spg_line_search = jax.jit(ls, static_argnums=(0,)) if self.jit else ls
+
+    def init_state(self, init_params, hyperparams_prox, *args, **kwargs) -> SPGState:
+        del hyperparams_prox
+        aux = self.fun(init_params, *args, **kwargs)[1] if self.has_aux else None
+        dtype = tree_single_dtype(init_params)
+        return SPGState(
+            iter_num=jnp.asarray(0), stepsize=jnp.asarray(1.0, dtype=dtype), error=jnp.asarray(jnp.inf, dtype=dtype),
+            aux=aux, x_prev=init_params, g_prev=tree_zeros_like(init_params),
+            f_hist=jnp.full((self.memory,), -jnp.inf, dtype=dtype),
+        )
+
+    def update(self, params, state, hyperparams_prox, *args, **kwargs) -> base.OptStep:
+        x = params
+        dtype = tree_single_dtype(x)
+        (fx, aux), g = self._value_and_grad_with_aux(x, *args, **kwargs)
+        unit = tree_sub(self._prox_grad(x, g, 1.0, hyperparams_prox), x)  # projected gradient at unit step
+        s, y = tree_sub(x, state.x_prev), tree_sub(g, state.g_prev)
+        sy, ss = tree_vdot(s, y), tree_vdot(s, s)
+        spectral = jnp.where(sy > 0, jnp.clip(ss / jnp.where(sy > 0, sy, 1.0), self.step_min, self.step_max),
+                             self.step_max)
+        unit_inf = jnp.max(jnp.abs(unit))
+        first = jnp.clip(1.0 / jnp.where(unit_inf > 0, unit_inf, 1.0), self.step_min, self.step_max)
+        step = jnp.where(state.iter_num == 0, first, spectral)
+        d = tree_sub(self._prox_grad(x, g, step, hyperparams_prox), x)
+        f_hist = jnp.roll(state.f_hist, 1).at[0].set(fx)
+        f_tol = self.f_tol_ulps * jnp.finfo(dtype).eps * jnp.maximum(1.0, jnp.abs(fx))
+        lam, exhausted = self._spg_line_search(
+            self.maxls, x, d, jnp.max(f_hist), self.slope * tree_vdot(g, d), f_tol, self.decrease_factor, args, kwargs
+        )
+        next_x = tree_add_scalar_mul(x, lam, d)
+        error = jnp.where(exhausted, jnp.inf, tree_l2_norm(unit))
+        next_state = SPGState(
+            iter_num=state.iter_num + 1, stepsize=jnp.asarray(step, dtype=dtype),
+            error=jnp.asarray(error, dtype=dtype), aux=aux, x_prev=x, g_prev=g, f_hist=f_hist,
+        )
+        return base.OptStep(params=next_x, state=next_state)
+
+
 @dataclass(eq=False)
 class LoopAwareProjectedGradient(ProjectedGradient):
-    """ProjectedGradient with independent outer (`unroll`) and line-search (`ls_unroll`) loop strategies."""
+    """ProjectedGradient with independent outer (`unroll`) and line-search (`ls_unroll`) loop strategies, and the
+    update rule `method` (one of PGD_RULES; module docstring)."""
 
     ls_unroll: bool = False
+    method: str = "spg"
 
     def __post_init__(self):
         if getattr(self, "check_projection", False):
             raise ValueError("check_projection wraps the inner solver's update and is not supported here")
+        if self.method not in PGD_RULES:
+            raise ValueError(f"PGD rule {self.method!r}: expected one of {', '.join(PGD_RULES)}")
         super().__post_init__()
-        self._pg = _LoopAwareProximalGradient(
+        rule = _LoopAwareSPG if self.method == "spg" else _LoopAwareProximalGradient
+        self._pg = rule(
             fun=self.fun,
             prox=prox.make_prox_from_projection(self.projection),
             value_and_grad=self.value_and_grad,
@@ -183,7 +301,7 @@ class LoopAwareProjectedGradient(ProjectedGradient):
             maxiter=self.maxiter,
             maxls=self.maxls,
             tol=self.tol,
-            acceleration=self.acceleration,
+            acceleration=self.acceleration and self.method == "fista",
             decrease_factor=self.decrease_factor,
             verbose=self.verbose,
             implicit_diff=self.implicit_diff,

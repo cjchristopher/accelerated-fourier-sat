@@ -336,8 +336,10 @@ class Optimiser(abc.ABC):
         unroll: bool = False,
         projection: Callable[[Array, Array], Array] | None = None,
         decode: Callable[[Array, Array], Array] | None = None,
+        pgd_rule: str = "spg",
     ) -> None:
         self.algo = algorithm
+        self.pgd_rule = pgd_rule  # pgd only: the update rule (solvers/loop_control.py, PGD_RULES)
         self.maxiter = maxiter
         self.warmup_sol = False
         self.warmup_x: NDArray | None = None
@@ -517,7 +519,7 @@ class Optimiser(abc.ABC):
                 custom = self._projection
                 pgd = LoopAwareProjectedGradient(
                     fun=evaluator, projection=box if custom is None else custom, maxiter=self.maxiter,
-                    has_aux=True, tol=tol, unroll=outer, ls_unroll=line_search,
+                    has_aux=True, tol=tol, unroll=outer, ls_unroll=line_search, method=self.pgd_rule,
                 )
 
                 def solve(x: Array, fixed_vars: Array, weights: tuple[Array, ...], **kw: Any) -> tuple[Array, Array]:

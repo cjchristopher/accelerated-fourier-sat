@@ -88,6 +88,7 @@ class OptimiserConfig:
     """Optimiser and stopping controls."""
 
     name: str = "pgd"
+    pgd_rule: str = "spg"  # PGD update rule: "spg" (spectral projected gradient) or "fista"
     max_iters: int = 100
     tolerance: float = 1e-3
     projection_type: str = "box"
