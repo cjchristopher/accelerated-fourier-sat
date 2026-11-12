@@ -368,6 +368,7 @@ def build_solver(
         tol=optimiser_cfg.tolerance,
         projection=None if eo is None else eo.project,
         decode=None if eo is None else eo.decode,
+        pgd_rule=optimiser_cfg.pgd_rule,
     )
     return solver, eo
 
@@ -1445,6 +1446,8 @@ if __name__ == "__main__":
     optimiser_opts("-i", "--iters_desc", type=int, field="max_iters", help="Solver maximum iterations")
     optimiser_opts("-q", "--solver_tol", type=float, field="tolerance", help="Optimiser convergence tolerance")
     optimiser_opts("-o", "--optimiser", "--optimizer", type=str, field="name", help="Optimiser algorithm")
+    optimiser_opts("--pgd_rule", type=str, choices=["spg", "fista"], field="pgd_rule",
+                   help="PGD update rule: spg (spectral projected gradient, default) or fista")
 
     output_opts = make_option_group("Output Aliases", "output_logging")
     output_opts("-d", "--debug", choices=LOG_LEVELS, field="debug_level", help=f"Set logging level ({LOG_LEVELS})")

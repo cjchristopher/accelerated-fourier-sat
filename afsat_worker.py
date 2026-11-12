@@ -312,6 +312,8 @@ def main() -> None:
     optimiser_opts("-i", "--iters_desc", type=int, field="max_iters", help="Max iterations")
     optimiser_opts("-q", "--solver_tol", type=float, field="tolerance", help="Solver tolerance")
     optimiser_opts("-o", "--optimiser", "--optimizer", type=str, field="name", help="Optimiser")
+    optimiser_opts("--pgd_rule", type=str, choices=["spg", "fista"], field="pgd_rule",
+                   help="PGD update rule: spg (default) or fista")
 
     output_opts = make_option_group("Output Aliases", "output_logging")
     output_opts("-d", "--debug", choices=LOG_LEVELS, field="debug_level", help=f"Set logging level ({LOG_LEVELS})")

@@ -126,6 +126,7 @@ python afsat.py [options] input_file.cnf
 - `-f, --fuzz INT`: Number of times to attempt fuzzing per batch (default: 0)
 - `-n, --n_devices INT`: Number of devices (e.g., GPUs) to use (default: all available, 0 = use all)
 - `-i, --iters_desc INT`: Descent iteration depth (default: 100)
+- `--pgd_rule STR`: PGD update rule, `spg` (spectral projected gradient, the default) or `fista` (the previous default). See Solver Algorithms below.
 - `-d, --debug LEVEL`: Set logging level: DEBUG, INFO, WARNING, or ERROR (default: ERROR)
 - `-e, --benchmark`: Enable benchmark mode (reduces output verbosity)
 - `-c, --counting`: Counting mode - count/enumerate solutions until timeout (default: False (off))
@@ -195,12 +196,14 @@ The solver uses JAX for hardware acceleration and automatic differentiation. It 
 
 AFSAT supports multiple optimization backends (default: `pgd`):
 
-- **pgd**: Projected Gradient Descent with box constraints (JAXOPT)
+- **pgd**: Projected Gradient Descent with box constraints (JAXOPT), with one of two update rules (`--pgd_rule`):
+  - `spg` (default): spectral projected gradient (SPG2; Birgin, Martinez and Raydan, SIAM J. Optim. 10, 2000). Barzilai-Borwein steps with a non-monotone line search along a feasible segment, so every iterate stays in the box (or on the XOR projection). On SHA-1 r20 preimages (16 instances, 5 random-seed repetitions of 300 s) it reached a lower best unsatisfied count than FISTA on every instance; on the PLE and cardinality benchmarks it matched FISTA within noise.
+  - `fista`: FISTA with backtracking, the previous default; its extrapolated points may leave the box.
 - **lbfgsb**: Limited-memory BFGS with bounds (JAXOPT)
 - **josp-lbfgsb**: JAXOPT's Scipy-wrapped L-BFGS-B
 - **sp-lbfgsb**: Scipy L-BFGS-B with JAX compiled objective function
 
-Note: The solver algorithm is currently hardcoded in the source. Support for command-line selection may be added in future versions.
+Select the backend with `-o`.
 
 ## License
 
