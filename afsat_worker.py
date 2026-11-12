@@ -19,6 +19,7 @@ from afsat import (
     prepare_problem,
     run_worker_single_batch,
 )
+from advice_pool import AdvicePool, LineReader
 from sat_loader import UnsatError
 from samplers import SAMPLERS
 from utils import AFSATConfig, LOG_LEVELS
@@ -145,15 +146,47 @@ def parse_prefix_line(line: str) -> tuple[np.ndarray, bool]:
     return lits, False
 
 
-def assignment_vector_to_lits(assign_vec: np.ndarray) -> np.ndarray:
-    """Map AFSAT assignment vector in {-1,0,+1} back to signed literals."""
-    nz = np.nonzero(assign_vec)[0]
+def assignment_vector_to_lits(assign_vec: np.ndarray, var_mapper=None, order: np.ndarray | None = None) -> np.ndarray:
+    """Map an AFSAT assignment vector in {-1,0,+1} (-1 is TRUE) back to signed literals in the input file's
+    variable numbering, in index order or in the given order of variable indices."""
+    nz = np.nonzero(assign_vec)[0] if order is None else order[assign_vec[order] != 0]
     if nz.size == 0:
         return np.empty(0, dtype=np.intc)
 
     signs = np.sign(assign_vec[nz]).astype(np.intc)
     lits = (nz.astype(np.intc) + 1) * (-signs)
+    if var_mapper is not None and var_mapper.dense_to_input_var:  # the loader compacted sparse variable ids
+        lits = np.asarray([var_mapper.dense_to_input(int(l)) for l in lits], dtype=np.intc)
     return lits.astype(np.intc)
+
+
+ADVICE_POLICIES = ("index", "agree", "random")  # random: free variables and phases at random (a control)
+
+
+def agreement_advice(
+    points: np.ndarray, points_unsat: np.ndarray, free: np.ndarray, elite_frac: float, best_signed: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, dict]:
+    """Advice ordered by agreement among the batch's best descents.
+
+    The elite is the best ceil(elite_frac * batch) descents by violated-clause count (at least 2). For each free
+    variable the elite's mean sign gives the phase (the best descent's sign breaks a tie) and its magnitude the
+    agreement. Variables are ordered by agreement, then by the elite's mean |x| (how firmly the descents hold the
+    value). Returns the signed phase vector, the variable order and summary statistics for the log."""
+    batch = points.shape[0]
+    m = min(batch, max(2, int(np.ceil(elite_frac * batch))))
+    elite = np.argsort(points_unsat, kind="stable")[:m]
+    signs = np.sign(points[elite])
+    mean = signs.mean(axis=0)
+    agree = np.abs(mean)
+    margin = np.abs(points[elite]).mean(axis=0)
+    phase = np.where(mean != 0, np.sign(mean), best_signed).astype(np.int8)
+    idx = np.flatnonzero(free)
+    order = idx[np.lexsort((-margin[idx], -agree[idx]))]
+    unanimous = int(np.count_nonzero(agree[idx] == 1.0))
+    stats = {"elite": m, "elite_unsat_min": int(points_unsat[elite[0]]), "elite_unsat_max": int(points_unsat[elite[-1]]),
+             "free": int(idx.size), "unanimous": unanimous,
+             "agree_q50": float(np.median(agree[idx])) if idx.size else 0.0}
+    return phase, order, stats
 
 
 def run_worker(
@@ -181,6 +214,17 @@ def run_worker(
     worker_time = time()
 
     n_units = len(prepared.sat_parser.unit_prefix)
+    var_mapper = prepared.sat_parser.var_mapper
+
+    # Advice policy (Dagster's launch command passes no worker flags, so these are environment variables):
+    #   AFSAT_ADVICE=index (default) | agree | random, AFSAT_ADVICE_ELITE=<fraction of the batch, default 0.5>,
+    #   AFSAT_ADVICE_STATS=1 logs the agreement statistics under either policy.
+    advice_policy = os.environ.get("AFSAT_ADVICE", "index")
+    if advice_policy not in ADVICE_POLICIES:
+        raise ValueError(f"AFSAT_ADVICE={advice_policy}: expected one of {ADVICE_POLICIES}")
+    elite_frac = float(os.environ.get("AFSAT_ADVICE_ELITE", "0.5"))
+    collect_points = advice_policy == "agree" or os.environ.get("AFSAT_ADVICE_STATS") == "1"
+    rng = np.random.default_rng(config.runtime_common.rand_seed if config.runtime_common.rand_seed >= 0 else None)
 
     emit_log(
         f"Worker ready | world_rank={world_rank} helper_rank={helper_rank}/{helper_count} "
@@ -198,6 +242,11 @@ def run_worker(
         f"vars={prepared.n_var} clauses={prepared.n_clause} batch={session.batch} phase={phase}"
     )
     emit_line("READY")
+
+    if os.environ.get("AFSAT_WORKER_MODE", "oneshot") == "stream":
+        run_stream(session, prepared, var_mapper, int(suggestion_size), elite_frac,
+                   int(os.environ.get("AFSAT_ADVICE_POOL", "1024")))
+        return
 
     while True:
         # emit_log("reading next line...")
@@ -225,22 +274,35 @@ def run_worker(
             # when the cube contradicts one of them or itself.
             prefix_vector = prepared.sat_parser.process_prefix_line([str(int(v)) for v in prefix_lits.tolist()])
             prefix_vectors = jnp.asarray(prefix_vector)[None, :]
-            result = run_worker_single_batch(session, prefix_vectors)
+            result = run_worker_single_batch(session, prefix_vectors, collect_points=collect_points)
 
             assign_vec_full = np.asarray(result.best_assignment_signed, dtype=np.int8)
             # Suggestions should not simply repeat fixed literals. That means every fixed
             # position, not just the received cube: the merged unit literals would otherwise
             # consume the whole suggestion budget with values the caller already knows.
-            assign_vec_suggest = assign_vec_full.copy()
-            assign_vec_suggest[np.asarray(prefix_vector) != 0] = 0
-
-            lits = assignment_vector_to_lits(assign_vec_suggest)
+            free = np.asarray(prefix_vector) == 0
             max_suggestions = max(int(suggestion_size), 0)
+            if collect_points:
+                phase, order, stats = agreement_advice(
+                    result.points, result.points_unsat, free, elite_frac, assign_vec_full
+                )
+                emit_log("advice policy=%s batch_best=%d %s" % (
+                    advice_policy, result.best_unsat, " ".join("%s=%s" % kv for kv in stats.items())))
+            if advice_policy == "agree":
+                lits = assignment_vector_to_lits(phase, var_mapper, order=order[:max_suggestions])
+            elif advice_policy == "random":
+                pick = rng.permutation(np.flatnonzero(free))[:max_suggestions]
+                lits = assignment_vector_to_lits(rng.choice(np.array([-1, 1], dtype=np.int8), size=free.size),
+                                                 var_mapper, order=pick)
+            else:
+                assign_vec_suggest = assign_vec_full.copy()
+                assign_vec_suggest[~free] = 0
+                lits = assignment_vector_to_lits(assign_vec_suggest, var_mapper)
             suggestion_lits = lits[:max_suggestions]
             emit_bridge_line("SUGGEST", suggestion_lits)
 
             if result.sat:
-                solution_lits = assignment_vector_to_lits(assign_vec_full)
+                solution_lits = assignment_vector_to_lits(assign_vec_full, var_mapper)
                 emit_bridge_line("SOLUTION", solution_lits)
 
         except UnsatError as err:
@@ -254,6 +316,68 @@ def run_worker(
             # as we do for an UnsatError.
             logger.exception("Worker request failed; skipping prefix")
             emit_log(f"request_failed {err}")
+
+
+def run_stream(session, prepared, var_mapper, suggestion_size: int, elite_frac: float, capacity: int) -> None:
+    """Streaming worker (AFSAT_WORKER_MODE=stream): descend continuously under the newest prefix, pool the descents
+    (advice_pool.AdvicePool keeps those consistent with each new prefix), and emit refreshed agreement advice after
+    every batch. Input is read without blocking, and only the newest of the prefixes waiting is used.
+    AFSAT_ADVICE_MIN_AGREE withholds literals whose elite agreement is below the threshold. With
+    AFSAT_BRIDGE_LOG_PREFIX=1 each prefix used is written to the bridge trace file as `PREFIX_USED <n> <lits>`."""
+    reader = LineReader(sys.stdin.fileno())
+    pool = AdvicePool(prepared.n_var, capacity=capacity, elite_frac=elite_frac)
+    log_prefix = os.environ.get("AFSAT_BRIDGE_LOG_PREFIX") == "1"
+    min_agree = float(os.environ.get("AFSAT_ADVICE_MIN_AGREE", "0"))
+    prefix_vector = prefix_vectors = None
+    batches = prefixes = dropped_total = 0
+    while True:
+        newest = None
+        for raw in reader.read_lines(block=prefix_vector is None):
+            if not raw.strip():
+                continue
+            try:
+                lits, stop = parse_prefix_line(raw)
+            except ValueError as err:
+                emit_log(f"request_failed {err}")
+                continue
+            if stop:
+                emit_log(f"Stop command received; shutting down worker loop (batches={batches} prefixes={prefixes})")
+                return
+            if lits.size:
+                newest = lits
+        if newest is None and reader.eof:
+            emit_log("Bridge stdin closed; exiting")
+            return
+        if newest is not None:
+            try:
+                pv = np.asarray(prepared.sat_parser.process_prefix_line([str(int(v)) for v in newest.tolist()]))
+            except UnsatError as err:
+                emit_log(f"unsat_prefix {err}")
+                prefix_vector = None
+                continue
+            prefix_vector, prefix_vectors = pv, jnp.asarray(pv)[None, :]
+            dropped_total += pool.set_prefix(prefix_vector)
+            prefixes += 1
+            if log_prefix and BRIDGE_TRACE_FH is not None:
+                BRIDGE_TRACE_FH.write("PREFIX_USED %d %s\n" % (newest.size, " ".join(map(str, newest.tolist()))))
+        if prefix_vector is None:
+            continue
+        try:
+            result = run_worker_single_batch(session, prefix_vectors, collect_points=True)
+        except UnsatError as err:
+            emit_log(f"unsat_prefix {err}")
+            prefix_vector = None
+            continue
+        batches += 1
+        pool.add(result.points, result.points_unsat)
+        phase, order, stats = pool.advice(suggestion_size, min_agree)
+        emit_bridge_line("SUGGEST", assignment_vector_to_lits(phase, var_mapper, order=order))
+        if result.sat:
+            emit_bridge_line("SOLUTION", assignment_vector_to_lits(
+                np.asarray(result.best_assignment_signed, dtype=np.int8), var_mapper))
+        if batches % 50 == 0:
+            emit_log("stream batches=%d prefixes=%d dropped=%d %s" % (
+                batches, prefixes, dropped_total, " ".join("%s=%s" % kv for kv in stats.items())))
 
 
 def main() -> None:
@@ -332,6 +456,14 @@ def main() -> None:
     instantiated = ap.instantiate(parsed)
     config = instantiated.config
     config.runtime_common.n_devices = config.runtime_common.n_devices or n_devices
+    # Dagster's launch command passes no worker flags, so these two can also be set from the environment.
+    if os.environ.get("AFSAT_WORKER_BATCH"):  # batch per device (as -b)
+        config.runtime_afsat.batch_per_device = int(os.environ["AFSAT_WORKER_BATCH"])
+    if os.environ.get("AFSAT_PGD_RULE"):  # PGD update rule (as --pgd_rule)
+        rule = os.environ["AFSAT_PGD_RULE"].strip().lower()
+        if rule not in ("spg", "fista"):
+            raise ValueError(f"AFSAT_PGD_RULE={rule!r}: expected spg or fista")
+        config.optimiser.pgd_rule = rule
 
     problem_file = parsed.cnf if parsed.cnf else parsed.problem_file
     if not problem_file:
