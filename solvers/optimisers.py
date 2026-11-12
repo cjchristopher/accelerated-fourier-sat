@@ -334,6 +334,8 @@ class Optimiser(abc.ABC):
         maxiter: int = 100,
         tol: float = 1e-3,
         unroll: bool = False,
+        projection: Callable[[Array, Array], Array] | None = None,
+        decode: Callable[[Array, Array], Array] | None = None,
     ) -> None:
         self.algo = algorithm
         self.maxiter = maxiter
@@ -343,6 +345,11 @@ class Optimiser(abc.ABC):
         # lbfgsb/pgd: one jitted kernel per (outer loop unrolled, line search unrolled), built on first use and
         # chosen from the batch size (solvers/loop_control.py). `unroll=True` unrolls the outer loop.
         self._evaluator, self._verifier, self._tol = evaluator, verifier, tol
+        # pgd only: `projection(x, fixed_vars)` replaces the box projection (e.g. EO groups onto simplices), and
+        # `decode(x, fixed_vars)` maps a descent's end point to the vertex that is verified and returned.
+        if (projection is not None or decode is not None) and algorithm != "pgd":
+            raise ValueError(f"A custom projection or decoding needs the pgd optimiser, not {algorithm}")
+        self._projection, self._decode = projection, decode
         self._loop_controlled = algorithm in ["lbfgsb", "pgd"]
         self._kernels: dict[tuple[bool, bool], Callable] = {}
 
@@ -506,21 +513,26 @@ class Optimiser(abc.ABC):
                 # optimised HLO is identical either way), and it is what makes the solve differentiable w.r.t.
                 # weights. jaxopt derives unroll from implicit_diff when unroll is "auto", so both loop strategies
                 # are always pinned explicitly here.
+                # A custom projection reads the point's pins, so it takes fixed_vars as its hyperparameters.
+                custom = self._projection
                 pgd = LoopAwareProjectedGradient(
-                    fun=evaluator, projection=box, maxiter=self.maxiter, has_aux=True, tol=tol,
-                    unroll=outer, ls_unroll=line_search,
+                    fun=evaluator, projection=box if custom is None else custom, maxiter=self.maxiter,
+                    has_aux=True, tol=tol, unroll=outer, ls_unroll=line_search,
                 )
 
                 def solve(x: Array, fixed_vars: Array, weights: tuple[Array, ...], **kw: Any) -> tuple[Array, Array]:
-                    x_opt, state = pgd.run(x, fixed_vars=fixed_vars, weights=weights, hyperparams_proj=(-1, 1), **kw)
+                    hyper = (-1, 1) if custom is None else fixed_vars
+                    x_opt, state = pgd.run(x, fixed_vars=fixed_vars, weights=weights, hyperparams_proj=hyper, **kw)
                     return x_opt, state.iter_num
+
+            decode = self._decode
 
             # `extra` is empty, or the folded-XOR rows (seq_eval_verify(folded_xor=True)), shared by every point.
             def opt(x: Array, fixed_vars: Array, weights: tuple[Array, ...], *extra: Any):
                 kw = {"xor_rows": extra[0]} if extra else {}
                 x_opt, iters = solve(x, fixed_vars, weights, **kw)
                 final_cost, eval_aux = evaluator(x_opt, fixed_vars, weights, **kw)
-                x_eval = eval_aux[0]
+                x_eval = eval_aux[0] if decode is None else decode(x_opt, fixed_vars)
                 final_aux: Any = (x_eval, final_cost)
                 unsat = jnp.squeeze(verifier(x_eval))
                 return x_eval, jnp.atleast_1d(unsat), jnp.atleast_1d(iters), final_aux
