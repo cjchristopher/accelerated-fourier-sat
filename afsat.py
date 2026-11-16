@@ -457,6 +457,9 @@ class AFSATBatchResult:
     eval_per_point: list[float]
     flips_per_point: list[int]
     elapsed_sec: float
+    # With collect_points: every descended point (batch x n_vars, float32) and its violated-clause count.
+    points: np.ndarray | None = None
+    points_unsat: np.ndarray | None = None
 
 
 def prepare_problem(
@@ -762,10 +765,13 @@ def _worker_request(session: AFSATWorkerSession, prefix_vectors: Array) -> tuple
     return session.solvers[keep], (), prefix_vectors
 
 
-def run_worker_single_batch(session: AFSATWorkerSession, prefix_vectors: Array | None = None) -> AFSATBatchResult:
+def run_worker_single_batch(
+    session: AFSATWorkerSession, prefix_vectors: Array | None = None, collect_points: bool = False
+) -> AFSATBatchResult:
     """One batch for one prefix, on the compiled programs of create_worker_session: draw the starting points (prefix
     applied), descend, and summarise on the device; the best point's count comes back, and with --stats the
-    per-descent statistics as well. Fuzzing, if enabled, is as in run_solver."""
+    per-descent statistics as well. Fuzzing, if enabled, is as in run_solver. collect_points also returns every
+    descended point and its violated-clause count (for advice built from the whole batch)."""
     start_batch = time()
     if prefix_vectors is None:
         prefix_vectors = session.unit_vector
@@ -855,6 +861,8 @@ def run_worker_single_batch(session: AFSATWorkerSession, prefix_vectors: Array |
         eval_per_point=eval_per_point,
         flips_per_point=flips_per_point,
         elapsed_sec=time() - start_batch,
+        points=np.asarray(opt_x, dtype=np.float32) if collect_points else None,
+        points_unsat=np.asarray(opt_unsat_ct).reshape(-1).astype(np.int64) if collect_points else None,
     )
 
 
