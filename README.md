@@ -35,7 +35,7 @@ Optionally, see https://github.com/NVIDIA/JAX-Toolbox for Docker images that may
 
 3. Install JAX and dependencies
 ```bash
-    pip install jax[cudaXX] tqdm sparklines jaxopt
+    pip install jax[cudaXX] jaxopt jsonargparse tqdm sparklines
 ```
    N.B. CUDA 12 is no longer receiving feature updates and future versions of JAX will not support it. 
    Nvidia deprecated support for many older architectures with the release of CUDA 13, and so an older version of JAX/CUDA may be required for your architecture.
@@ -207,7 +207,7 @@ Select the backend with `-o`.
 
 ### Dagster helper (`afsat_worker.py`)
 
-`afsat_worker.py` runs AFSAT as a helper to a Dagster CDCL worker (`--helper_backend cls`). One worker process lives for the whole Dagster run and serves every job its helper is given, on any DAG node. It compiles the first node's problem, reports `READY`, then reads lines on stdin and answers on stdout:
+`afsat_worker.py` runs AFSAT as a helper to a Dagster CDCL worker (`--helper_backend cls`). How to set up and run Dagster with it can be found in [CLS.md](https://github.com/ANU-HPC/dagster/blob/AFSAT-Integration/CLS.md) on a Dagster branch supporting CLS helpers (currently AFSAT-Integration). One worker process lives for the whole Dagster run and serves every job its helper is given, on any DAG node. It compiles the first node's problem, reports `READY`, then reads lines on stdin and answers on stdout:
 
 - `NODE <seq> <id> <cnf path>`: job `seq` is on another DAG node. The worker compiles that node's problem the first time it is named and reuses the compiled session afterwards.
 - `MESSAGE <seq> <n> <lits>`: job `seq`'s incoming assignments (possibly none). The worker starts afresh and answers `READY <seq>`. The bridge discards any output sent before that answer and forwards prefixes only after it.
